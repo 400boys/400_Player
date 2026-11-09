@@ -1,0 +1,13 @@
+# JVT conformance vectors rust_h264 is expected to fail: formats it rejects
+# with DecodeError::Unsupported. Any other failure, or one of these passing,
+# makes run.sh exit non-zero.
+
+# Slice groups (FMO)
+FM1_BT_B
+FM1_FT_E
+FM2_SVA_C
+
+# SP/SI slices
+SP1_BT_A
+sp2_bt_b
+

@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Release Linux (tar.gz, .deb, AppImage) — 100% Standalone
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies (zero FFmpeg)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libxkbcommon-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev file wget
+      - name: Install Rust toolchain (1.94.0)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Build Debian package (.deb) and tarball
+        run: bash packaging/debian/build-deb.sh
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            target/debian/*.deb
+            target/debian/*.tar.gz

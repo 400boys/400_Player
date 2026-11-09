@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="100%" height="100%">
+  <defs>
+    <!-- Dégradé du fond (Squircle) -->
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1c2a33" />
+      <stop offset="50%" stop-color="#111921" />
+      <stop offset="100%" stop-color="#0a0f14" />
+    </linearGradient>
+
+    <!-- Lueur de bordure du fond -->
+    <linearGradient id="bg-border" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#4e707a" stop-opacity="0.7" />
+      <stop offset="50%" stop-color="#25373f" stop-opacity="0.4" />
+      <stop offset="100%" stop-color="#2c464f" stop-opacity="0.6" />
+    </linearGradient>
+
+    <!-- Halo lumineux ambiant derrière le logo -->
+    <radialGradient id="ambient-glow" cx="50%" cy="50%" r="45%">
+      <stop offset="0%" stop-color="#2af5d2" stop-opacity="0.15" />
+      <stop offset="60%" stop-color="#00b4c5" stop-opacity="0.05" />
+      <stop offset="100%" stop-color="#000000" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Dégradé principal Cyan / Menthe (4 + Play) -->
+    <linearGradient id="cyan-main" x1="20%" y1="15%" x2="80%" y2="85%">
+      <stop offset="0%" stop-color="#8dffdf" />
+      <stop offset="45%" stop-color="#3de6c9" />
+      <stop offset="100%" stop-color="#14b8c4" />
+    </linearGradient>
+
+    <!-- Ombre du pli 3D sous la barre verticale du 4 -->
+    <linearGradient id="fold-shadow" x1="0%" y1="30%" x2="85%" y2="70%">
+      <stop offset="0%" stop-color="#045d68" stop-opacity="0.85" />
+      <stop offset="35%" stop-color="#0c8c99" stop-opacity="0.45" />
+      <stop offset="100%" stop-color="#14b8c4" stop-opacity="0" />
+    </linearGradient>
+
+    <!-- Dégradé du triangle Orange interne -->
+    <linearGradient id="orange-main" x1="15%" y1="15%" x2="85%" y2="85%">
+      <stop offset="0%" stop-color="#ffaa2b" />
+      <stop offset="55%" stop-color="#f57600" />
+      <stop offset="100%" stop-color="#d44900" />
+    </linearGradient>
+
+    <!-- Biseau lumineux du triangle Orange -->
+    <linearGradient id="orange-rim" x1="0%" y1="0%" x2="90%" y2="90%">
+      <stop offset="0%" stop-color="#ffd06b" />
+      <stop offset="50%" stop-color="#ff8800" />
+      <stop offset="100%" stop-color="#b83700" />
+    </linearGradient>
+
+    <!-- Ombre portée globale du logo -->
+    <filter id="drop-shadow" x="-15%" y="-15%" width="130%" height="130%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="24" result="blur"/>
+      <feOffset in="blur" dx="0" dy="16" result="offsetBlur"/>
+      <feFlood flood-color="#000000" flood-opacity="0.55" result="offsetColor"/>
+      <feComposite in="offsetColor" in2="offsetBlur" operator="in" result="offsetBlur"/>
+      <feMerge>
+        <feMergeNode in="offsetBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Découpe pour appliquer l'ombre du pli uniquement sur la branche inférieure droite -->
+    <clipPath id="main-shape-clip">
+      <path d="M 426 244 Q 448 218 474 238 L 806 488 Q 842 515 804 542 L 432 790 Q 388 820 388 768 L 388 616 L 214 616 Q 192 616 192 594 L 192 538 Q 192 520 205 505 Z M 388 430 L 290 540 L 388 540 Z M 463 366 Q 463 332 492 352 L 696 490 Q 726 510 696 530 L 492 666 Q 463 686 463 652 Z" />
+    </clipPath>
+  </defs>
+
+  <!-- Conteneur Icône (Squircle) -->
+  <rect x="66" y="66" width="892" height="892" rx="196" fill="url(#bg-grad)" stroke="url(#bg-border)" stroke-width="6" />
+
+  <!-- Halo lumineux central -->
+  <circle cx="512" cy="512" r="420" fill="url(#ambient-glow)" />
+
+  <!-- Groupe principal du logo avec ombre portée -->
+  <g filter="url(#drop-shadow)">
+    <!-- Forme principale "4 + Play" -->
+    <path fill="url(#cyan-main)" fill-rule="evenodd" d="M 426 244
+             Q 448 218 474 238
+             L 806 488
+             Q 842 515 804 542
+             L 432 790
+             Q 388 820 388 768
+             L 388 616
+             L 214 616
+             Q 192 616 192 594
+             L 192 538
+             Q 192 520 205 505
+             Z
+             M 388 430
+             L 290 540
+             L 388 540
+             Z
+             M 463 366
+             Q 463 332 492 352
+             L 696 490
+             Q 726 510 696 530
+             L 492 666
+             Q 463 686 463 652
+             Z" />
+
+    <!-- Effet de pli 3D à la base (x = 463) -->
+    <g clip-path="url(#main-shape-clip)">
+      <polygon points="463,630 680,530 680,760 463,810" fill="url(#fold-shadow)" />
+    </g>
+
+    <!-- Second triangle Play orange à l'intérieur -->
+    <path fill="url(#orange-main)" stroke="url(#orange-rim)" stroke-width="6" stroke-linejoin="round" d="M 500 422
+             Q 500 395 523 410
+             L 642 492
+             Q 666 509 642 526
+             L 523 608
+             Q 500 623 500 596
+             Z" />
+  </g>
+</svg>

@@ -1,0 +1,6 @@
+# Lumen400 formatting. Wide lines and compact one-line literals keep the UI code (lots of small
+# painter calls and builder chains) readable instead of exploding it over dozens of lines.
+edition = "2024"
+max_width = 180
+use_small_heuristics = "Max"
+newline_style = "Unix"

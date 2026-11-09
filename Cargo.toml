@@ -1,0 +1,84 @@
+[workspace]
+resolver = "3"
+members = ["crates/lumen400-core", "crates/lumen400-engine", "crates/lumen400"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Lumen400 contributors"]
+description = "Lumen400 — a modern, 100% standalone pure-Rust GPU-accelerated media player."
+keywords = ["media-player", "video", "audio", "pure-rust", "wgpu"]
+categories = ["multimedia::video", "multimedia::audio"]
+
+[workspace.dependencies]
+lumen400-core = { path = "crates/lumen400-core" }
+lumen400-engine = { path = "crates/lumen400-engine" }
+
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+rtrb = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "7"
+fastrand = "2"
+natord = "1"
+walkdir = "2"
+realfft = "3"
+rustfft = "6"
+chardetng = "1"
+encoding_rs = "0.8"
+clap = { version = "4", features = ["derive"] }
+cpal = "0.18"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "wayland", "x11", "clipboard", "system_fonts"] }
+rfd = "0.17"
+egui = { version = "0.37", default-features = false }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+sys-locale = "0.3"
+keepawake = "0.6"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+rust_h264 = "0.6"
+rust_h265 = "0.4"
+oxideav-core = "0.1"
+oxideav-ac3 = "0.0"
+oxideav-aac = "0.1"
+oxideav-opus = "0.0"
+oxideav-vorbis = "0.0"
+oxideav-mp1 = "0.0"
+oxideav-mp3 = "0.1"
+oxideav-mpeg12video = "0.0"
+oxideav-mpeg4video = "0.1"
+oxideav-prores = "0.1"
+
+# Dependencies are optimised even in dev builds so the UI and the DSP stay usable.
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 16
+strip = false
+
+# Quick optimised builds for iteration (cargo build --profile fast).
+[profile.fast]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+incremental = true
+strip = false
+debug = "line-tables-only"
+
+[patch.crates-io]
+oxideav-aac = { path = "crates/oxideav-aac" }
+rust_h264 = { path = "crates/rust_h264" }

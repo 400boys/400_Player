@@ -1,0 +1,117 @@
+name: CI
+
+# Build and test on every push and pull request. Runs the default (std)
+# configuration and the no_std + alloc configuration, so a stray `std::`
+# path fails here instead of for a downstream no_std user.
+on:
+  push:
+  pull_request:
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: std
+            args: ""
+          - name: no_std
+            args: --no-default-features
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ci-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
+          restore-keys: |
+            ci-${{ matrix.name }}-${{ runner.os }}-
+
+      - name: Test
+        run: cargo test --release ${{ matrix.args }}
+
+      - name: Golden corpus digests and threaded-vs-serial bench corpus
+        # Decodes the full bench corpus with the active SIMD backend and
+        # compares against scalar-reference digests (ignored by default).
+        if: matrix.name == 'std'
+        run: cargo test --release -- --ignored golden_corpus_digests threaded_matches_serial_bench_corpus
+
+  msrv:
+    # The oldest Rust in Cargo.toml's rust-version must keep building
+    name: Test on the minimum Rust version (1.89)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Test
+        run: cargo test --release
+
+  no_std_target:
+    # Cross-check the library on a real no_std target (no std available at
+    # all), which the host no_std test run above cannot prove.
+    name: Check no_std target (thumbv7em-none-eabi)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain with embedded target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabi
+
+      - name: Check library without std
+        run: cargo check --lib --no-default-features --target thumbv7em-none-eabi
+
+  lint:
+    name: Format and clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        # Mirror the output into the job summary (visible on the public run
+        # page) so lint failures can be read without signing in.
+        run: |
+          set -o pipefail
+          cargo clippy --all-targets --features dev-internals -- -D warnings 2>&1 | tee clippy.log
+        shell: bash
+
+      - name: Publish clippy output to the job summary
+        if: failure()
+        run: |
+          {
+            echo "## clippy output"
+            echo '```'
+            grep -E "^(error|warning)|-->|^\s*= " clippy.log | head -200
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
