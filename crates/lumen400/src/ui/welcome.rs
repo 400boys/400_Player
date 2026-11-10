@@ -88,7 +88,6 @@ impl LumenApp {
                         open_actions.push(*a);
                     } else {
                         self.settings.advanced_mode = true;
-                        self.save_settings_now();
                     }
                 }
                 x += widths[i] + gap;

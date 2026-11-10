@@ -266,7 +266,6 @@ impl LumenApp {
                     );
                     if btn_simple.on_hover_text("Revenir à l'écran d'accueil épuré standard").clicked() {
                         self.settings.advanced_mode = false;
-                        self.save_settings_now();
                     }
 
                     ui.add_space(10.0);

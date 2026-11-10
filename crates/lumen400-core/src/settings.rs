@@ -292,7 +292,8 @@ pub struct Settings {
     pub window: WindowState,
     pub last_dir: Option<String>,
     pub screenshot_dir: Option<String>,
-    /// Advanced studio / library dashboard view mode.
+    /// Advanced studio / library dashboard view mode (in-memory session mode, default is false).
+    #[serde(skip)]
     pub advanced_mode: bool,
 }
 
