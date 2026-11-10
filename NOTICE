@@ -1,7 +1,7 @@
-# Lumen400 — Third-Party Notices & Credits
+# 400_Player — Third-Party Notices & Credits
 
-Lumen400 est distribué sous double licence **MIT OR Apache-2.0**.
-Lumen400 est une création 100 % autonome en pur Rust (`#![forbid(unsafe_code)]`), inspirée ergonomiquement de VLC media player, mais **ne contient aucune ligne de code issue de VLC ni de FFmpeg** et ne dépend d'aucune bibliothèque C/C++ multimédia externe.
+400_Player est distribué sous double licence **MIT OR Apache-2.0**.
+400_Player est une création 100 % autonome en pur Rust (`#![forbid(unsafe_code)]`), inspirée ergonomiquement de VLC media player, mais **ne contient aucune ligne de code issue de VLC ni de FFmpeg** et ne dépend d'aucune bibliothèque C/C++ multimédia externe.
 
 ## 1. Polices de caractères (embarquées dans `assets/fonts/`)
 

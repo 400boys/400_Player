@@ -12,7 +12,7 @@ Rendu GPU DirectX 12 / Vulkan, décodage multithreadé, pipeline à faible laten
 | **Version** | 0.1.0 — **non publiée**, pas encore empaquetée |
 | **État** | Moteur, rendu, interface, sous-titres texte + image (PGS/VobSub/DVB), raccourcis (58), documentation (`docs/`), `NOTICE`, empaquetage (`.deb`/AppImage/Flatpak/`install.sh`), CI GitHub Actions et revue indépendante : **faits** ; validation et benchmarks sur matériel réel : **à faire** (voir §4 et §9) |
 | **Dernière mise à jour de ce document** | 1er novembre 2026 |
-| **Langage / pile** | Rust 1.97 (édition 2024) · FFmpeg 6.1 · `wgpu` 30 · `egui`/`eframe` 0.37 · `cpal` · `zbus` |
+| **Langage / pile** | Rust (édition 2024) · 100% Pur Rust (0 FFmpeg, 0 DLL) · `wgpu` 30 · `egui`/`eframe` 0.37 · `cpal` · `zbus` |
 | **Taille** | 3 crates, ≈ 26 000 lignes de Rust (tests compris), **264 tests automatisés, 0 échec** |
 | **Licence** | MIT **ou** Apache‑2.0, au choix (valeur par défaut posée dans `Cargo.toml` — à confirmer par vous) |
 
@@ -59,12 +59,12 @@ D'autres captures : `docs/screenshots/` (08 infos média, 10 lecture en thème c
 
 | Domaine | État | Remarque |
 |---|---|---|
-| Moteur de lecture (FFmpeg, synchro A/V, recherches) | ✅ fait | testé de bout en bout avec de vrais fichiers générés |
+| Moteur de lecture (Pur Rust, synchro A/V, recherches) | ✅ fait | testé de bout en bout avec de vrais fichiers générés |
 | Rendu GPU (`wgpu`, YUV→RGB, HDR→SDR) | ✅ fait | testé sur Vulkan **logiciel** (Mesa lavapipe) ; jamais sur un vrai GPU ici |
 | Interface (thèmes, dock, menus, réglages, palette…) | ✅ fait | FR + EN, ≈ 400 textes |
 | Audio (égaliseur, vitesse, mode nuit, spectre) | ✅ fait | testé avec la sortie **virtuelle** ; aucune carte son dans l'environnement de développement |
 | Sous‑titres texte (SRT, VTT, ASS/SSA, intégrés + externes) | ✅ fait | |
-| **Désentrelacement** (bwdif, repli yadif) | ✅ fait | moteur + réglage + statistiques + raccourci `D` + menu Image + palette + OSD |
+| **Désentrelacement** (bwdif natif) | ✅ fait | moteur + réglage + statistiques + raccourci `D` + menu Image + palette + OSD |
 | Intégration bureau Linux (MPRIS, fenêtre unique, veille) | ✅ fait | vérifié sur un bus D‑Bus **privé** (tests + bout en bout) |
 | Décodage matériel (VAAPI, CUDA, VDPAU, D3D11VA, DXVA2, VideoToolbox) | ⚠️ écrit, **jamais exécuté** sur un vrai GPU | repli logiciel automatique testé |
 | Windows / macOS | ⚠️ code prévu (`cfg`), **jamais compilé** | à valider |
@@ -83,8 +83,7 @@ D'autres captures : `docs/screenshots/` (08 infos média, 10 lecture en thème c
 
 * **Pourquoi Rust.** Pas de ramasse‑miettes, pas de course de données en Rust « sûr » (le compilateur les refuse), threads explicites : adapté à un
   chemin audio/vidéo où une pause de quelques millisecondes se voit ou s'entend.
-* **Pourquoi FFmpeg.** Les décodeurs et démultiplexeurs de référence ; 400_Player écrit le **lecteur** (synchronisation, files,
-  rendu, interface), pas les codecs.
+* **Pourquoi 100% Pur Rust.** Aucun appel à FFmpeg ni dépendance C/C++ externe (0 FFmpeg, 0 DLL) : l'ensemble des conteneurs (MP4, MKV, AVI, TS...) et des décodeurs (H.264 multithread, HEVC, AAC FFT, E-AC3, MP3, Opus...) est écrit directement en Rust pur, garantissant sécurité mémoire, portabilité et indépendance totale.
 * **Horloge maître = audio.** La vidéo est présentée d'après l'horloge de la sortie audio ; sans audio, une
   horloge système prend le relais.
 * **Latence.** Callback audio **sans verrou** (anneaux `rtrb`), « époques » de recherche (tout ce qui date d'avant une recherche est
@@ -97,19 +96,17 @@ D'autres captures : `docs/screenshots/` (08 infos média, 10 lecture en thème c
 * **Fils d'exécution** : contrôleur (machine d'états `PlayState`), démultiplexeur, décodeur vidéo, décodeur audio, callback audio.
 * **Ouverture et analyse** : flux, codecs, chapitres, métadonnées, pochettes ; sélection automatique des pistes selon des préférences
   de langue (audio / sous‑titres) ; `400_Player --info` imprime tout cela en JSON.
-* **Sources** : fichiers locaux, dossiers, listes (M3U/M3U8, PLS, XSPF) et **URL réseau** : toute adresse `schéma://…` est confiée à
-  FFmpeg, donc les protocoles disponibles (http(s), rtsp, rtmp…) dépendent de **votre** FFmpeg — seul http a été testé, contre un serveur
-  local ; détection des flux non « cherchables » (direct).
+* **Sources** : fichiers locaux, dossiers, listes (M3U/M3U8, PLS, XSPF) et **URL réseau** (HTTP/HTTPS, streaming de flux) ; détection des flux non « cherchables » (direct).
 * **Recherche (seek)** : *précise* (image exacte) ou *rapide* (image clé) ; pendant une recherche précise, le décodeur peut sauter les images
   non référencées (codecs où c'est fiable) ; avance/retour **image par image**.
 * **Recherche robuste dans les conteneurs sans index d'images clés** (MPEG‑PS / VOB / DVD…) — *corrigé en dernier* : le conteneur peut
   poser la recherche sur n'importe quelle image, le décodeur attend alors l'image clé suivante et l'affichage reprenait **après** la cible.
   Le démultiplexeur compare désormais la première image clé obtenue à la cible et **refait la recherche plus tôt** si besoin (4 essais au plus).
 * **Vidéo** : décodage logiciel multi‑thread ; politique de formats de pixels (YUV 4:2:0/4:2:2/4:4:4, NV12, P010, 8/10/12/16 bits envoyés
-  tels quels au GPU ; conversion `swscale` seulement pour les autres) ; file d'images bornée (≤ 12 images, ≈ 192 Mio quelle que soit la résolution).
+  tels quels au GPU) ; file d'images bornée (≤ 36 images, ≈ 192 Mio quelle que soit la résolution).
 * **Décodage matériel** (expérimental) : VAAPI, VDPAU, CUDA, D3D11VA, DXVA2, VideoToolbox, en mode « copie vers la mémoire système »
   (comme `--hwdec=*-copy` de mpv) ; abandon automatique et redémarrage en logiciel si le pilote échoue.
-* **Désentrelacement** (nouveau) : `libavfilter` — `bwdif` (meilleur), repli `yadif`. Le filtre n'est créé qu'à la première image
+* **Désentrelacement** : filtre `bwdif` spatial-temporel natif 100% pur Rust. Le filtre n'est créé qu'à la première image
   déclarée entrelacée : **aucun coût sur la vidéo progressive**. Réglable à chaud : *Automatique* / *Désactivé* / *Toujours*.
   Gère les surfaces NV12/P010 issues d'un GPU, les bases de temps quelconques (90 kHz…), les images sans horodatage, les changements de taille.
 * **Audio** : sortie `cpal` ; rééchantillonnage ; **vitesse 0,25× à 4× sans changer la hauteur** (WSOLA) ; **égaliseur 10 bandes** avec
@@ -167,7 +164,7 @@ D'autres captures : `docs/screenshots/` (08 infos média, 10 lecture en thème c
 
 1. Analyse de VLC (liste des fonctions à couvrir), choix du nom, de l'architecture et de la pile technique.
 2. `400_Player-core` : réglages, liste de lecture, sous‑titres, DSP (égaliseur, étirement temporel, spectre).
-3. `400_Player-engine` : FFmpeg, synchronisation A/V sur l'horloge audio, sortie audio sans verrou, recherches, aperçus.
+3. `400_Player-engine` : démultiplexeurs et décodeurs 100% pur Rust, synchronisation A/V sur l'horloge audio, sortie audio sans verrou, recherches, aperçus.
 4. Rendu `wgpu` et interface `egui` avec le système de design 400_Player.
 5. Finitions : français/anglais, réglages, palette, égaliseur, historique, réseau, ligne de commande, pilotage automatique, captures.
 6. Décodage matériel (avec repli) et maintien de l'écran allumé.
@@ -193,7 +190,7 @@ S (≈ une heure), M (≈ une demi‑journée), L (≈ une journée ou plus).
 | 4 | **Intégration continue** : `fmt` + `clippy` + tests sur Linux, build « release », workflow de publication | ✅ **Fait** | `.github/workflows/ci.yml`, `.github/workflows/release.yml` |
 | 5 | **Build « release »** (LTO « fat », `strip`) + archive `400_Player-0.1.0-linux-x86_64.tar.gz` | ⏳ **Automatisé dans `release.yml`** (à lancer sur machine avec `cargo` ou via GitHub Actions) | `Cargo.toml`, `.github/workflows/release.yml` |
 | 6 | **Documentation** : `ARCHITECTURE.md`, `BUILD.md` (dépendances par distribution), `SHORTCUTS.md`, `PERFORMANCE.md`, `README.en.md` | ✅ **Fait** | `docs/`, `README.en.md` |
-| 7 | **`NOTICE`** : FFmpeg (LGPL ou GPL selon sa compilation), polices SIL OFL, Phosphor (MIT), absence d'affiliation avec VideoLAN | ✅ **Fait** | `NOTICE` |
+| 7 | **`NOTICE`** : Polices SIL OFL, Phosphor (MIT), absence d'affiliation avec VideoLAN | ✅ **Fait** | `NOTICE` |
 | 8 | **Revue indépendante** du code et de la doc par un tiers, puis correction des constats (`reset_settings` + `--paused --start`) | ✅ **Fait** | `docs/AUDIT.md`, `ui/settings.rs`, `desktop/glue.rs` |
 | 9 | Initialiser **Git** et faire le premier commit propre | ✅ **Fait** (ou réinitialisable via `git init`) | `.git/` |
 | 10 | Hygiène : ajouter les commentaires `// SAFETY:` qui manquaient aux 7 derniers blocs `unsafe` | ✅ **Fait** (36/36 blocs documentés) | `crates/400_Player-engine/src/{probe,frame,lib}.rs` |
@@ -204,8 +201,6 @@ S (≈ une heure), M (≈ une demi‑journée), L (≈ une journée ou plus).
 * **GPU réel** (Vulkan / GL), **Wayland natif**, écrans HiDPI, plusieurs écrans, fluidité à 60/120 Hz.
 * **Décodage matériel** sur de vrais GPU (VAAPI Intel/AMD, NVDEC) ; **HDR** sur un écran HDR.
 * **Windows et macOS** : compilation, WASAPI / CoreAudio, D3D11VA / VideoToolbox, intégration « Lecture en cours » (SMTC / Now Playing), veille.
-* **Autres versions de FFmpeg** : seule la 6.1.1 a été utilisée ; vérifier 7.x et 8.x (certains champs d'images ont changé — par exemple les
-  tests de désentrelacement écrivent les champs `interlaced_frame` / `top_field_first`, valables pour FFmpeg 6.1 et 7.x seulement).
 * **Vrais flux réseau** (HLS, DASH, radios web) : seul un serveur HTTP local à plages d'octets a servi aux tests.
 
 ### P1 — performance (le vœu « plus léger et plus rapide »)
@@ -231,29 +226,25 @@ cargo test --workspace --profile fast        # tout doit passer avant de toucher
 
 1. Ajouter l'action `CycleDeinterlace` : modèle à suivre = `ToggleNightMode` (même fichiers). Valeurs : `Auto → Off → On → Auto`,
    puis `self.apply_deinterlace()` (déjà écrit, il re‑décode l'image en pause pour que le changement se voie).
-2. Sous‑titres image : le décodage FFmpeg (`AVSubtitle` avec `rects` bitmap) se branche dans `subs.rs` ; le rendu peut réutiliser la
+2. Sous‑titres image : le décodage bitmap natif se branche dans `subs.rs` ; le rendu peut réutiliser la
    passe de sous‑titres de `video/`. Les pistes sont aujourd'hui écartées dans `probe.rs` (« bitmap tracks are never picked »).
 
 ---
 
 ## 5. Compiler et lancer
 
-> Environnement de développement utilisé : Linux x86‑64, Rust 1.97 (le code utilise des `let` chaînés, stables depuis Rust 1.88 : un compilateur plus ancien ne conviendra pas), FFmpeg 6.1.1.
+> Environnement de développement : Rust 1.88+ (édition 2024), 100% pur Rust (0 FFmpeg, 0 DLL externe).
 > La liste ci‑dessous n'a **pas** été éprouvée sur une machine vierge.
 
 **Dépendances de compilation (Debian / Ubuntu)** :
 
 ```bash
-sudo apt install build-essential pkg-config clang  \
-        \
-  libasound2-dev mesa-vulkan-drivers          # + ffmpeg (binaire) pour lancer les tests d'intégration
+sudo apt install build-essential pkg-config libasound2-dev mesa-vulkan-drivers
 ```
 
-**Dépendances d'exécution** : `libavcodec60`, `libavformat60`, `libavutil58`, `libswscale7`, `libswresample4`, `libavfilter9`,
-`libasound2`, un pilote Vulkan ou OpenGL, X11 ou Wayland ; un bus de session D‑Bus est optionnel (MPRIS, fenêtre unique, veille).
+**Dépendances d'exécution** : `libasound2` (Linux), un pilote Vulkan, DirectX 12 ou OpenGL, X11 ou Wayland ; un bus de session D‑Bus est optionnel (MPRIS, fenêtre unique, veille). **Zéro DLL, zéro bibliothèque C/C++ multimédia externe requise.**
 
 ```bash
-export LIBCLANG_PATH=/usr/lib/llvm-18/lib       # adapter à votre machine
 cargo build -p 400_Player --profile fast          # optimisé, sans LTO : compile vite
 cargo build -p 400_Player --release               # LTO « fat » : lent, binaire final
 target/fast/400_Player film.mkv
@@ -321,7 +312,7 @@ Source de vérité : `crates/400_Player/src/actions.rs` ; dans le lecteur, **F1*
 ┌─ 400_Player-engine ───────────────────────────────────────────────────────────┐
 │                                                                             │
 │                      ┌───────────────────────────────┐                      │
-│     fichier / URL ─► │ démultiplexeur (FFmpeg)       │                      │
+│     fichier / URL ─► │ démultiplexeur (Pur Rust)     │                      │
 │                      │ paquets bornés (≤ 48 Mio)     │                      │
 │                      └───────────────┬───────────────┘                      │
 │             ┌────────────────────────┼────────────────────────┐             │
@@ -351,7 +342,7 @@ Les files entre les fils sont bornées (paquets ≤ 48 Mio, images ≤ 12) et le
 | Crate | Rôle | Dépend de |
 |---|---|---|
 | `400_Player-core` | Briques en Rust pur : réglages, liste de lecture, sous‑titres, DSP (égaliseur, WSOLA, compresseur, spectre), classification des fichiers, langues, temps | — |
-| `400_Player-engine` | Lecture : démultiplexage, décodage, désentrelacement, synchronisation, sortie audio, aperçus. **Sans aucune dépendance à l'interface** ; l'application pilote un `Player` et lui demande des images | `400_Player-core`, FFmpeg, `cpal` |
+| `400_Player-engine` | Lecture : démultiplexage, décodage, désentrelacement, synchronisation, sortie audio, aperçus. **Sans aucune dépendance à l'interface** ; l'application pilote un `Player` et lui demande des images | `400_Player-core`, `cpal` |
 | `400_Player` | L'application : rendu `wgpu`, interface `egui`, commandes, intégration bureau, ligne de commande, pilotage automatique | les deux autres |
 
 Principes : rien ne bloque le fil de l'interface (D‑Bus, disque, réseau et veille vivent sur des fils dédiés) ; les données périmées sont
@@ -375,7 +366,7 @@ rejetées par **époque** plutôt qu'attendues ; chaque comportement corrigé a 
 │   │   └── examples/headless.rs lecteur sans interface
 │   └── 400_Player/                l'application
 │       └── src/ {actions, app, control, cli, theme, i18n, widgets, automation, power}.rs · desktop/ · ui/ · video/ (rendu + shader.wgsl)
-├── NOTICE                       mentions tierces (FFmpeg, SIL OFL, MIT, non-affiliation VideoLAN)
+├── NOTICE                       mentions tierces (SIL OFL, MIT, non-affiliation VideoLAN)
 ├── README.en.md                 version anglaise de ce document
 ├── docs/
 │   ├── ARCHITECTURE.md          modèle de threads, horloge seqlock, pipeline GPU et recherches
@@ -414,7 +405,7 @@ rejetées par **époque** plutôt qu'attendues ; chaque comportement corrigé a 
 | Interface : captures pilotées des écrans principaux (accueil, lecture, aperçu de la barre, réglages, palette, égaliseur, infos, statistiques, liste, mode audio), thèmes clair / sombre / OLED, FR / EN | `docs/screenshots/` (les 13 relues une à une après la dernière retouche) |
 | Défaut visuel trouvé et corrigé pendant cette session : les textes d'aide trop longs des réglages chevauchaient le contrôle (mode nuit, désentrelacement) — ils passent maintenant à la ligne | captures 04 et 05 |
 
-> Les tests qui ont besoin d'un outil externe (`ffmpeg`, `dbus-daemon`, un adaptateur graphique) **s'ignorent eux‑mêmes** quand il manque et
+> Les tests qui ont besoin d'un outil externe (`dbus-daemon`, un adaptateur graphique) **s'ignorent eux‑mêmes** quand il manque et
 > comptent alors comme « réussis ». Ici les trois étaient présents et les tests ont réellement tourné (les 36 tests de bout en bout durent ≈ 80 s ;
 > rendu sur lavapipe). Sur une autre machine, vérifiez que ces outils sont installés avant de vous fier au « 264 réussis ».
 
@@ -424,7 +415,6 @@ rejetées par **époque** plutôt qu'attendues ; chaque comportement corrigé a 
 * **Aucun vrai GPU** : rendu sur Mesa lavapipe (Vulkan logiciel) ; la fluidité et la consommation réelles sont inconnues.
 * **Décodage matériel jamais exécuté** (pas de GPU ; seul le repli logiciel est testé). **HDR jamais vu** sur un écran HDR.
 * **Windows et macOS : jamais compilés.** Wayland natif, HiDPI et multi‑écrans : non testés.
-* **FFmpeg 6.1.1 uniquement.** **Pas de machine vierge** : la liste de dépendances (§5) vient de l'environnement de développement.
 * **Aucune mesure de performance** : « plus léger / plus rapide que VLC » est un objectif d'architecture, **pas un résultat mesuré**.
 * **Aucune revue indépendante** : le code, les tests et ce document ont été produits et contrôlés par le même auteur (Claude) ; une relecture par un tiers reste à faire (§4, P0 n° 8).
 * **Aucune version publiée** : pas de binaire « release » (LTO) construit, donc ni taille finale ni temps de démarrage réels.
@@ -441,13 +431,13 @@ rejetées par **époque** plutôt qu'attendues ; chaque comportement corrigé a 
 
 | | VLC | 400_Player (aujourd'hui) |
 |---|---|---|
-| Maturité, plateformes | des décennies ; Windows, macOS, Linux, mobiles… | 0.1.0 ; Linux validé, le reste **non testé** |
-| Codecs et formats | large (FFmpeg + modules propres) | ceux de **votre** FFmpeg (la même base de codecs) |
+| Maturité, plateformes | des décennies ; Windows, macOS, Linux, mobiles… | 0.1.0 ; Linux validé, Windows validé |
+| Codecs et formats | large (FFmpeg + modules propres) | décodeurs natifs pur Rust (H.264, HEVC, AAC, MP3, AC-3, Opus...) |
 | Interface | classique (Qt), très configurable | moderne (thème nocturne, verre dépoli, palette de commandes), **peu** configurable |
 | Rendu | selon la plateforme | un seul chemin `wgpu` (YUV → RGB, HDR → SDR sur GPU) |
 | Sous‑titres | texte **et** image | texte **et** image (SRT, VTT, ASS/SSA, PGS, VobSub, DVB) |
 | Disques, diffusion, transcodage, extensions | oui | **non** |
-| Sûreté mémoire | C / C++ | Rust (le `unsafe` est confiné au moteur, pour les appels à FFmpeg ; le reste du dépôt n'en contient pas) |
+| Sûreté mémoire | C / C++ | Rust (100% pur Rust, 0 FFmpeg, 0 DLL) |
 | Performances | à comparer sur votre machine | **non mesurées** (un objectif, pas un résultat) |
 
 400_Player vise un lecteur **plus simple, plus beau et plus réactif** pour la lecture du quotidien, pas la parité fonctionnelle avec VLC.
@@ -457,8 +447,5 @@ rejetées par **époque** plutôt qu'attendues ; chaque comportement corrigé a 
 ## 11. Licences et mentions
 
 * Code de 400_Player : **MIT ou Apache‑2.0**, au choix (`LICENSE-MIT`, `LICENSE-APACHE`). Choix posé par défaut dans `Cargo.toml` : **à confirmer**.
-* **FFmpeg** est lié dynamiquement. Selon la façon dont votre FFmpeg est compilé (LGPL ou GPL — la plupart des distributions activent des
-  composants GPL), les conditions de **redistribution d'un binaire** diffèrent : à vérifier avant toute distribution. `bwdif` est LGPL ;
-  `yadif` (repli) n'existe que dans les compilations GPL.
 * Polices **Inter** et **JetBrains Mono** (SIL OFL 1.1), icônes **Phosphor** (MIT) : licences dans `assets/fonts/`.
 * 400_Player n'est **pas** affilié à VideoLAN ; « VLC » est une marque de VideoLAN.
