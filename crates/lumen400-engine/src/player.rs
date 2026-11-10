@@ -898,7 +898,7 @@ impl Controller {
         let Some(r) = self.ready.as_ref() else { return };
         let frames = &self.shared.frames;
         let video_ok = !r.has_video
-            || (!frames.is_empty() && (accurate || frames.len() >= 6 || since.elapsed() > Duration::from_millis(150)))
+            || (!frames.is_empty() && ((accurate && frames.len() >= 2) || frames.len() >= 6 || since.elapsed() > Duration::from_millis(1000)))
             || frames.drained();
         let audio_ok = !r.has_audio
             || self.audio.as_ref().is_none_or(|a| {

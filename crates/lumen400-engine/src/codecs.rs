@@ -79,6 +79,7 @@ enum PureVideoBackend {
     Hevc {
         decoder: Box<HevcDecoder>,
         hvcc_len_size: Option<u8>,
+        pending_pts: std::collections::BinaryHeap<std::cmp::Reverse<i64>>,
     },
     Oxide(Box<dyn OxideDecoder>),
     RawOrImage,
@@ -121,10 +122,11 @@ impl VideoDecoder {
                 }));
                 *avcc_len_size = h264_feed_extradata(decoder, &self.stream.extra_data);
             }
-            PureVideoBackend::Hevc { decoder, hvcc_len_size } => {
+            PureVideoBackend::Hevc { decoder, hvcc_len_size, pending_pts } => {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     while decoder.flush().is_some() {}
                 }));
+                pending_pts.clear();
                 *hvcc_len_size = hevc_feed_extradata(decoder, &self.stream.extra_data);
             }
             PureVideoBackend::Oxide(dec) => {
@@ -189,9 +191,12 @@ impl VideoDecoder {
                 }
                 return Ok(());
             }
-            PureVideoBackend::Hevc { decoder, hvcc_len_size } => {
+            PureVideoBackend::Hevc { decoder, hvcc_len_size, pending_pts } => {
                 if data.is_empty() {
                     return Ok(());
+                }
+                if let Some(p) = pts {
+                    pending_pts.push(std::cmp::Reverse(p));
                 }
                 let nals = if let Some(len_sz) = *hvcc_len_size {
                     let v = hevc_parse_hvcc(data, len_sz);
@@ -217,7 +222,8 @@ impl VideoDecoder {
                     if let Ok(frames) = res {
                         for hf in frames {
                             self.has_reference = true;
-                            self.out_queue.push_back(hevc_frame_to_raw(&self.stream, hf, pts));
+                            let f_pts = pending_pts.pop().map(|std::cmp::Reverse(p)| p).or(pts);
+                            self.out_queue.push_back(hevc_frame_to_raw(&self.stream, hf, f_pts));
                         }
                     }
                 }
@@ -283,7 +289,7 @@ impl VideoDecoder {
                     }
                 }
             }
-            PureVideoBackend::Hevc { decoder, .. } => {
+            PureVideoBackend::Hevc { decoder, pending_pts, .. } => {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut out = Vec::new();
                     while let Some(hf) = decoder.flush() {
@@ -293,7 +299,8 @@ impl VideoDecoder {
                 }));
                 if let Ok(frames) = res {
                     for hf in frames {
-                        self.out_queue.push_back(hevc_frame_to_raw(&self.stream, hf, None));
+                        let f_pts = pending_pts.pop().map(|std::cmp::Reverse(p)| p);
+                        self.out_queue.push_back(hevc_frame_to_raw(&self.stream, hf, f_pts));
                     }
                 }
             }
@@ -331,10 +338,14 @@ fn create_video_backend(stream: &StreamDesc) -> PureVideoBackend {
             PureVideoBackend::H264 { decoder, avcc_len_size }
         }
         "hevc" | "h265" | "hvc1" | "hev1" => {
-            let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, 16));
             let mut decoder = Box::new(HevcDecoder::new().with_display_order().with_threads(threads));
             let hvcc_len_size = hevc_feed_extradata(&mut decoder, &stream.extra_data);
-            PureVideoBackend::Hevc { decoder, hvcc_len_size }
+            PureVideoBackend::Hevc {
+                decoder,
+                hvcc_len_size,
+                pending_pts: std::collections::BinaryHeap::new(),
+            }
         }
         "mpeg1video" | "mpeg2video" | "mpeg4" | "mpeg4video" | "prores" => {
             let ox_name = if stream.codec == "mpeg4" { "mpeg4video" } else { stream.codec.as_str() };
@@ -489,6 +500,36 @@ fn hevc_frame_to_raw(stream: &StreamDesc, hf: HevcFrame, pts: Option<i64>) -> Ra
         unreachable!();
     }
 
+    if let (PixelData::U16(y_u16), PixelData::U16(u_u16), PixelData::U16(v_u16)) = (hf.y, hf.u, hf.v) {
+        let y_stride = w as usize * 2;
+        let c_stride = cw as usize * 2;
+        let mut y = vec![0u8; y_u16.len() * 2];
+        y.copy_from_slice(bytemuck::cast_slice(&y_u16));
+        let mut u = vec![0u8; u_u16.len() * 2];
+        u.copy_from_slice(bytemuck::cast_slice(&u_u16));
+        let mut v = vec![0u8; v_u16.len() * 2];
+        v.copy_from_slice(bytemuck::cast_slice(&v_u16));
+
+        let mut frame = RawVideoFrame::from_planar_buffers(
+            pix_fmt,
+            w,
+            h,
+            vec![
+                (y, y_stride, w, h),
+                (u, c_stride, cw, ch),
+                (v, c_stride, cw, ch),
+            ],
+        );
+        frame.set_pts(pts);
+        frame.set_aspect_ratio(stream.sar);
+        frame.set_interlaced(stream.interlaced, true);
+        frame.set_color_space(stream.color_space);
+        frame.set_color_range(stream.color_range);
+        frame.set_color_transfer_characteristic(stream.color_trc);
+        frame.set_color_primaries(stream.color_primaries);
+        return frame;
+    }
+
     let mut frame = RawVideoFrame::new(pix_fmt, w, h);
     frame.set_pts(pts);
     frame.set_aspect_ratio(stream.sar);
@@ -497,24 +538,6 @@ fn hevc_frame_to_raw(stream: &StreamDesc, hf: HevcFrame, pts: Option<i64>) -> Ra
     frame.set_color_range(stream.color_range);
     frame.set_color_transfer_characteristic(stream.color_trc);
     frame.set_color_primaries(stream.color_primaries);
-
-    for (idx, plane) in [(&hf.y, 0usize), (&hf.u, 1usize), (&hf.v, 2usize)] {
-        match idx {
-            PixelData::U8(src) => {
-                let dst = frame.data_mut(plane);
-                let n = dst.len().min(src.len());
-                dst[..n].copy_from_slice(&src[..n]);
-            }
-            PixelData::U16(src) => {
-                let dst = frame.data_mut(plane);
-                for (d_chunk, &sample) in dst.chunks_exact_mut(2).zip(src.iter()) {
-                    let b = sample.to_le_bytes();
-                    d_chunk[0] = b[0];
-                    d_chunk[1] = b[1];
-                }
-            }
-        }
-    }
     frame
 }
 

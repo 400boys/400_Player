@@ -29,3 +29,4 @@ oxideav-mp3.workspace = true
 oxideav-mpeg12video.workspace = true
 oxideav-mpeg4video.workspace = true
 oxideav-prores.workspace = true
+bytemuck.workspace = true
