@@ -137,7 +137,7 @@ impl LumenApp {
         }
         if req.clear_history {
             self.history.clear();
-            self.history_dirty = true;
+            self.save_history_now();
             self.toast(crate::state::ToastKind::Success, t(T::HistoryCleared), None);
         }
         if req.reset_settings {

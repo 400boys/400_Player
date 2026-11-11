@@ -464,3 +464,12 @@ impl eframe::App for LumenApp {
         self.shutdown();
     }
 }
+
+impl Drop for LumenApp {
+    fn drop(&mut self) {
+        if !self.quitting {
+            self.quitting = true;
+            self.shutdown();
+        }
+    }
+}

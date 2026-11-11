@@ -103,7 +103,8 @@ impl LumenApp {
                 ui.horizontal(|ui| {
                     widgets::section_title(ui, &p, t(T::Recent));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let r = ui.add(egui::Label::new(RichText::new(t(T::ClearHistory)).size(12.0).color(p.text_faint)).sense(Sense::click()));
+                        let text = RichText::new(t(T::ClearHistory)).size(12.0);
+                        let r = ui.add(egui::Button::new(text).frame(false));
                         if r.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
@@ -151,7 +152,8 @@ impl LumenApp {
         }
         if clear_history {
             self.history.clear();
-            self.history_dirty = true;
+            self.save_history_now();
+            self.toast(crate::state::ToastKind::Success, t(T::HistoryCleared), None);
         }
         match action {
             Some(RecentAction::Play(src)) => self.open_inputs(vec![src], false),
@@ -163,7 +165,7 @@ impl LumenApp {
             }
             Some(RecentAction::Remove(src)) => {
                 self.history.remove(&src);
-                self.history_dirty = true;
+                self.save_history_now();
             }
             None => {}
         }
