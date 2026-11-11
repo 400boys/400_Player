@@ -147,8 +147,9 @@ pub fn play_button(ui: &mut Ui, p: &Palette, playing: bool, busy: bool, size: f3
             stroke: Stroke::new(1.2, fade(top, 0.9)).into(),
         }));
         let glyph = if playing { crate::ui::icons::PAUSE } else { crate::ui::icons::PLAY };
-        // The play triangle needs an optical offset to the right so its visual mass is centered in the circle.
-        let nudge = if playing { 0.0 } else { size * 0.092 };
+        // Both the pause bars and play triangle need an optical offset to the right
+        // to compensate for Phosphor font glyph metrics and center visual mass in the circle.
+        let nudge = if playing { size * 0.065 } else { size * 0.092 };
         ui.painter().text(center + vec2(nudge, 0.0), Align2::CENTER_CENTER, glyph.to_string(), icon_font(size * 0.46, true), Color32::from_rgb(14, 11, 26));
         if busy {
             let time = ui.input(|i| i.time) as f32;
