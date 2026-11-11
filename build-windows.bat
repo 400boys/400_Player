@@ -2,7 +2,7 @@
 setlocal
 
 echo ============================================================================
-echo   Lumen400 v0.1.0 - Compilation autonome Windows (100%% Pur Rust, 0 DLL)
+echo   400_Player v0.1.0 - Compilation autonome Windows (100%% Pur Rust, 0 DLL)
 echo ============================================================================
 echo.
 
@@ -26,12 +26,13 @@ cargo --version
 rustc --version
 echo.
 
-taskkill /F /IM lumen400.exe >nul 2>nul
+taskkill /F /IM "400 Media Player.exe" >nul 2>nul
+taskkill /F /IM "400_Media_Player.exe" >nul 2>nul
 if exist ".cargo\config.toml" del /F /Q ".cargo\config.toml"
-if exist "lumen400-crash.log" del /F /Q "lumen400-crash.log"
+if exist "400player-crash.log" del /F /Q "400player-crash.log"
 
-echo [2/3] Compilation de lumen400.exe en mode Release optimise...
-cargo build --release -p lumen400
+echo [2/3] Compilation de 400 Media Player.exe en mode Release optimise...
+cargo build --release -p lumen400 --bin 400_Media_Player
 if %ERRORLEVEL% neq 0 (
     echo.
     echo [ERREUR] La compilation a echoue.
@@ -42,32 +43,33 @@ if %ERRORLEVEL% neq 0 (
 echo.
 echo [3/3] Preparation du dossier portable dist-windows\...
 if not exist "dist-windows" mkdir "dist-windows"
-copy /Y "target\release\lumen400.exe" "dist-windows\lumen400.exe"
+copy /Y "target\release\400_Media_Player.exe" "dist-windows\400 Media Player.exe"
 if %ERRORLEVEL% neq 0 (
-    echo [ERREUR] Impossible de copier lumen400.exe dans dist-windows\.
+    echo [ERREUR] Impossible de copier l executable dans dist-windows\.
     pause
     exit /b 1
 )
+copy /Y "target\release\400_Media_Player.exe" "400 Media Player.exe" >nul
 copy /Y "README.md" "dist-windows\README.md" >nul
 copy /Y "LICENSE-MIT" "dist-windows\LICENSE-MIT" >nul
 copy /Y "NOTICE" "dist-windows\NOTICE" >nul
 
 echo.
 echo ============================================================================
-echo   TERMINE : Executable autonome pret dans dist-windows\lumen400.exe
+echo   TERMINE : Executable autonome pret dans dist-windows\400 Media Player.exe
 echo   (Aucune DLL externe ni FFmpeg requis)
 echo ============================================================================
 echo.
-echo Lancement de dist-windows\lumen400.exe...
+echo Lancement de dist-windows\400 Media Player.exe...
 set "WGPU_BACKEND=dx12"
 set "RUST_BACKTRACE=1"
-"dist-windows\lumen400.exe"
+"dist-windows\400 Media Player.exe"
 if %ERRORLEVEL% neq 0 (
     echo.
-    echo [DIAGNOSTIC] lumen400.exe s est termine avec le code : %ERRORLEVEL%
-    if exist "lumen400-crash.log" (
-        echo --- Contenu de lumen400-crash.log ---
-        type "lumen400-crash.log"
+    echo [DIAGNOSTIC] L application s est terminee avec le code : %ERRORLEVEL%
+    if exist "400player-crash.log" (
+        echo --- Contenu de 400player-crash.log ---
+        type "400player-crash.log"
     )
 )
 pause
