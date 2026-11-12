@@ -1,0 +1,33 @@
+name: 💡 Suggestion de fonctionnalité / Feature request
+description: Proposer une idée, une amélioration ou une nouvelle fonctionnalité pour 400_Player
+title: "[FEAT]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Merci pour votre suggestion pour enrichir 400_Player !
+  - type: textarea
+    id: problem
+    attributes:
+      label: Votre suggestion est-elle liée à un problème ou un besoin précis ?
+      description: Une description claire et concise du problème rencontré ou du besoin.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Solution ou fonctionnalité proposée
+      description: Décrivez précisément ce que vous aimeriez voir implémenté.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives envisagées
+      description: Avez-vous pensé à d'autres solutions alternatives ?
+  - type: textarea
+    id: context
+    attributes:
+      label: Contexte additionnel / Références
+      description: Liens, captures d'écran, comportements dans d'autres lecteurs (VLC, mpv...), etc.

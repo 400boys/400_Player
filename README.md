@@ -1,5 +1,11 @@
 # 400_Player (400 Media Player)
 
+[![CI](https://github.com/400boys/400_Player/actions/workflows/ci.yml/badge.svg)](https://github.com/400boys/400_Player/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-edition%202024-orange?logo=rust)](https://www.rust-lang.org/)
+[![Pure Rust](https://img.shields.io/badge/FFmpeg-0%25%20(Pure%20Rust)-brightgreen)](https://github.com/400boys/400_Player)
+[![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue)](LICENSE-MIT)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)](https://github.com/400boys/400_Player)
+
 **Un lecteur multimédia moderne, écrit en 100% pur Rust, inspiré de VLC.**
 Rendu GPU DirectX 12 / Vulkan, décodage multithreadé, pipeline à faible latence, interface soignée (thème « nocturne », sélecteur de skins et mode avancé), français et anglais.
 
