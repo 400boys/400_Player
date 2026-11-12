@@ -1851,7 +1851,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
-name = "lumen400"
+name = "mach2"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
+
+[[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
+]
+
+[[package]]
+name = "media_player_400"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1862,8 +1877,8 @@ dependencies = [
  "egui",
  "image",
  "keepawake",
- "lumen400-core",
- "lumen400-engine",
+ "media_player_400-core",
+ "media_player_400-engine",
  "parking_lot",
  "pollster 0.4.0",
  "rfd",
@@ -1876,7 +1891,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lumen400-core"
+name = "media_player_400-core"
 version = "0.1.0"
 dependencies = [
  "chardetng",
@@ -1891,14 +1906,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "lumen400-engine"
+name = "media_player_400-engine"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
  "cpal",
  "crossbeam-channel",
  "image",
- "lumen400-core",
+ "media_player_400-core",
  "oxideav-aac",
  "oxideav-ac3",
  "oxideav-core",
@@ -1917,21 +1932,6 @@ dependencies = [
  "rustfft",
  "thiserror 2.0.21",
  "tracing",
-]
-
-[[package]]
-name = "mach2"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
-
-[[package]]
-name = "matchers"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
-dependencies = [
- "regex-automata",
 ]
 
 [[package]]

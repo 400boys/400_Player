@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draws the Lumen400 application icon at every size the packagers need.
+"""Draws the 400_media_player application icon at every size the packagers need.
 
     python3 tools/gen_icon.py          # writes assets/icon/*
 
@@ -88,10 +88,10 @@ def main():
     images = {}
     for n in SIZES:
         img = render(n)
-        img.save(OUT / f"lumen400-{n}.png", optimize=True)
+        img.save(OUT / f"400_media_player-{n}.png", optimize=True)
         images[n] = img
-    images[256].save(OUT / "lumen400.ico", format="ICO", sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
-    (OUT / "lumen400.svg").write_text('<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">\n  <defs>\n    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="75%" y2="100%">\n      <stop offset="0%" stop-color="#c4b5fd" />\n      <stop offset="45%" stop-color="#a78bfa" />\n      <stop offset="100%" stop-color="#4f46e5" />\n    </linearGradient>\n    <radialGradient id="top-glow" cx="25%" cy="15%" r="55%">\n      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.48" />\n      <stop offset="100%" stop-color="#ffffff" stop-opacity="0" />\n    </radialGradient>\n    <filter id="play-shadow" x="-20%" y="-20%" width="140%" height="140%">\n      <feDropShadow dx="0" dy="9" stdDeviation="10" flood-color="#28146e" flood-opacity="0.38" />\n    </filter>\n  </defs>\n  <!-- Squircle background -->\n  <rect x="0" y="0" width="512" height="512" rx="120" ry="120" fill="url(#bg-grad)" />\n  <rect x="0" y="0" width="512" height="512" rx="120" ry="120" fill="url(#top-glow)" />\n  <!-- Optically centred rounded play triangle -->\n  <path d="M 192 156\n           C 192 141, 208 132, 221 140\n           L 350 220\n           C 362 228, 362 244, 350 252\n           L 221 332\n           C 208 340, 192 331, 192 316\n           Z"\n        transform="translate(0, 20)"\n        fill="#ffffff"\n        filter="url(#play-shadow)" />\n</svg>\n', encoding="utf-8")
+    images[256].save(OUT / "400_media_player.ico", format="ICO", sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
+    (OUT / "400_media_player.svg").write_text('<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">\n  <defs>\n    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="75%" y2="100%">\n      <stop offset="0%" stop-color="#c4b5fd" />\n      <stop offset="45%" stop-color="#a78bfa" />\n      <stop offset="100%" stop-color="#4f46e5" />\n    </linearGradient>\n    <radialGradient id="top-glow" cx="25%" cy="15%" r="55%">\n      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.48" />\n      <stop offset="100%" stop-color="#ffffff" stop-opacity="0" />\n    </radialGradient>\n    <filter id="play-shadow" x="-20%" y="-20%" width="140%" height="140%">\n      <feDropShadow dx="0" dy="9" stdDeviation="10" flood-color="#28146e" flood-opacity="0.38" />\n    </filter>\n  </defs>\n  <!-- Squircle background -->\n  <rect x="0" y="0" width="512" height="512" rx="120" ry="120" fill="url(#bg-grad)" />\n  <rect x="0" y="0" width="512" height="512" rx="120" ry="120" fill="url(#top-glow)" />\n  <!-- Optically centred rounded play triangle -->\n  <path d="M 192 156\n           C 192 141, 208 132, 221 140\n           L 350 220\n           C 362 228, 362 244, 350 252\n           L 221 332\n           C 208 340, 192 331, 192 316\n           Z"\n        transform="translate(0, 20)"\n        fill="#ffffff"\n        filter="url(#play-shadow)" />\n</svg>\n', encoding="utf-8")
     print("wrote", ", ".join(sorted(p.name for p in OUT.iterdir())))
 
 

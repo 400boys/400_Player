@@ -1,0 +1,18 @@
+[package]
+name = "media_player_400-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "400_media_player core: pure-Rust playlist, subtitle, DSP, settings and i18n logic (no native dependencies)."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+fastrand.workspace = true
+natord.workspace = true
+realfft.workspace = true
+chardetng.workspace = true
+encoding_rs.workspace = true
+thiserror.workspace = true

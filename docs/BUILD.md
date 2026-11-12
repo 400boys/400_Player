@@ -1,8 +1,8 @@
-# Lumen400 — Guide de Compilation (100 % Autonome, 0 FFmpeg)
+# 400_media_player — Guide de Compilation (100 % Autonome, 0 FFmpeg)
 
 ## 1. Prérequis
 - **Rust** : `1.94.0` ou plus récent (édition 2024).
-- **Aucune dépendance à FFmpeg (`libav*`) ni `libclang`** : Lumen400 compile 100 % en pur Rust (`#![forbid(unsafe_code)]`).
+- **Aucune dépendance à FFmpeg (`libav*`) ni `libclang`** : 400_media_player compile 100 % en pur Rust (`#![forbid(unsafe_code)]`).
 
 ### Ubuntu / Debian
 ```bash

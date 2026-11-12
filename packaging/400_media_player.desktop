@@ -1,0 +1,23 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=400_media_player
+GenericName=Media Player
+GenericName[fr]=Lecteur multimédia
+Comment=A modern, fast, GPU-accelerated media player
+Comment[fr]=Un lecteur multimédia moderne, rapide et accéléré par le GPU
+Exec=400_media_player %U
+TryExec=400_media_player
+Icon=400_media_player
+Terminal=false
+StartupNotify=true
+StartupWMClass=400_media_player
+Categories=AudioVideo;Audio;Video;Player;
+Keywords=video;audio;music;movie;player;media;multimedia;vidéo;musique;
+MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/mpeg;video/x-flv;video/3gpp;video/3gpp2;video/x-ms-wmv;video/ogg;video/mp2t;video/x-m4v;application/ogg;application/vnd.apple.mpegurl;audio/mpeg;audio/mp4;audio/x-m4a;audio/aac;audio/flac;audio/x-flac;audio/ogg;audio/opus;audio/x-opus+ogg;audio/x-vorbis+ogg;audio/wav;audio/x-wav;audio/webm;audio/x-matroska;audio/x-ms-wma;audio/x-aiff;audio/ac3;audio/x-mpegurl;audio/mpegurl;application/x-mpegurl;audio/x-scpls;application/xspf+xml;
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=New window
+Name[fr]=Nouvelle fenêtre
+Exec=400_media_player --new-instance

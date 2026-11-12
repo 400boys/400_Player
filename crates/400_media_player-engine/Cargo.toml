@@ -1,0 +1,32 @@
+[package]
+name = "media_player_400-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "400_media_player engine: 100% pure-Rust native demux/decode, bwdif deinterlacer, audio-master A/V sync, lock-free audio output."
+
+[dependencies]
+media_player_400-core.workspace = true
+realfft.workspace = true
+rustfft.workspace = true
+cpal.workspace = true
+rtrb.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+image.workspace = true
+rust_h264.workspace = true
+rust_h265.workspace = true
+oxideav-core.workspace = true
+oxideav-ac3.workspace = true
+oxideav-aac.workspace = true
+oxideav-opus.workspace = true
+oxideav-vorbis.workspace = true
+oxideav-mp1.workspace = true
+oxideav-mp3.workspace = true
+oxideav-mpeg12video.workspace = true
+oxideav-mpeg4video.workspace = true
+oxideav-prores.workspace = true
+bytemuck.workspace = true

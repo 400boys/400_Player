@@ -1,19 +1,19 @@
 [workspace]
 resolver = "3"
-members = ["crates/lumen400-core", "crates/lumen400-engine", "crates/lumen400"]
+members = ["crates/400_media_player-core", "crates/400_media_player-engine", "crates/400_media_player"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-authors = ["Lumen400 contributors"]
-description = "Lumen400 — a modern, 100% standalone pure-Rust GPU-accelerated media player."
+authors = ["400_media_player contributors"]
+description = "400_media_player — a modern, 100% standalone pure-Rust GPU-accelerated media player."
 keywords = ["media-player", "video", "audio", "pure-rust", "wgpu"]
 categories = ["multimedia::video", "multimedia::audio"]
 
 [workspace.dependencies]
-lumen400-core = { path = "crates/lumen400-core" }
-lumen400-engine = { path = "crates/lumen400-engine" }
+media_player_400-core = { path = "crates/400_media_player-core" }
+media_player_400-engine = { path = "crates/400_media_player-engine" }
 
 anyhow = "1"
 thiserror = "2"

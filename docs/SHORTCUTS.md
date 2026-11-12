@@ -1,6 +1,6 @@
 # Référence des raccourcis clavier, gestes souris et CLI (`SHORTCUTS.md`)
 
-La table unique de vérité de toutes les commandes se trouve dans `crates/lumen400/src/actions.rs` (58 actions). Appuyez sur **`F1`** (ou **`?`**) pour afficher l'aide des raccourcis, et sur **`Ctrl+K`** pour ouvrir la palette de commandes.
+La table unique de vérité de toutes les commandes se trouve dans `crates/400_media_player/src/actions.rs` (58 actions). Appuyez sur **`F1`** (ou **`?`**) pour afficher l'aide des raccourcis, et sur **`Ctrl+K`** pour ouvrir la palette de commandes.
 
 ## Principaux raccourcis clavier
 - `Espace` / `K` : Lecture / Pause

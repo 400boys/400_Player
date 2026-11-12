@@ -1,8 +1,39 @@
+# === Rust / Cargo ===
 /target/
 **/*.rs.bk
-*.bak
-.DS_Store
-*.exe
-*.log
-*.tmp
+# Cargo.lock est versionné (application binaire)
+*.d
 
+# === Build artifacts ===
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.exp
+*.lib
+*.obj
+*.o
+*.a
+
+# === OS files ===
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.tmp
+*.bak
+*.swp
+*~
+
+# === IDE / Editor ===
+.idea/
+.vscode/
+*.iml
+*.code-workspace
+
+# === Logs ===
+*.log
+
+# === Package caches ===
+*.tar.gz
+*.zip

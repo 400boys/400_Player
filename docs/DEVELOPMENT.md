@@ -1,4 +1,4 @@
-# Développer Lumen400
+# Développer 400_media_player
 
 Ce document décrit la façon de compiler, de tester et de vérifier visuellement le lecteur.
 
@@ -21,21 +21,21 @@ Ce document décrit la façon de compiler, de tester et de vérifier visuellemen
 ```bash
 export LIBCLANG_PATH=/usr/lib/llvm-18/lib          # adapter à votre machine
 
-cargo build -p lumen400 --profile fast             # optimisé, sans LTO : rapide à compiler
-cargo build -p lumen400 --release                  # LTO « fat » : lent à compiler (≈ plusieurs minutes), binaire final
+cargo build -p 400_media_player --profile fast             # optimisé, sans LTO : rapide à compiler
+cargo build -p 400_media_player --release                  # LTO « fat » : lent à compiler (≈ plusieurs minutes), binaire final
 
 cargo test   --workspace --profile fast            # tout (≈ 3 min sur 2 cœurs)
 cargo clippy --workspace --all-targets --profile fast
 cargo fmt --all                                    # rustfmt.toml : largeur 180
 ```
 
-Les tests d'intégration du moteur (`crates/lumen400-engine/tests/playback.rs`) jouent de vrais
+Les tests d'intégration du moteur (`crates/400_media_player-engine/tests/playback.rs`) jouent de vrais
 fichiers générés à la demande dans `target/test-media/` avec la sortie audio **virtuelle** (aucune
 carte son requise). Ils sont sérialisés (verrou `serial()`) parce que certains mesurent des durées.
 
 ## Pilotage automatique de l'interface
 
-`lumen400 --automation script.txt` exécute un script d'interface (captures d'écran, vérifications de bout en bout).
+`400_media_player --automation script.txt` exécute un script d'interface (captures d'écran, vérifications de bout en bout).
 Un script est un fichier texte, une commande par ligne (`#` commence un commentaire) :
 
 ```text
@@ -63,7 +63,7 @@ Une ligne `expect` qui échoue est signalée sur `stderr` et le processus sort a
 ```bash
 export WGPU_BACKEND=vulkan LIBGL_ALWAYS_SOFTWARE=1       # rendu logiciel (Mesa lavapipe)
 xvfb-run -a -s "-screen 0 1600x1000x24" \
-  target/fast/lumen400 --ephemeral --virtual-audio --automation mon_script.txt
+  target/fast/400_media_player --ephemeral --virtual-audio --automation mon_script.txt
 ```
 
 `--ephemeral` ne lit ni n'écrit les réglages et l'historique de l'utilisateur ; `--virtual-audio`
@@ -71,16 +71,16 @@ ne touche jamais à la carte son.
 
 ## Bureau (MPRIS, fenêtre unique)
 
-Les tests de `crates/lumen400/src/desktop/linux.rs` lancent un `dbus-daemon` **privé** (jamais le
+Les tests de `crates/400_media_player/src/desktop/linux.rs` lancent un `dbus-daemon` **privé** (jamais le
 bus de session de l'utilisateur) et vérifient : les propriétés et méthodes MPRIS, les signaux
 `PropertiesChanged` et `Seeked`, le transfert d'un second lancement vers la fenêtre ouverte
-(`lumen400.Control.Open`) et la protection du nom de bus contre le vol par un nouvel arrivant.
+(`400_media_player.Control.Open`) et la protection du nom de bus contre le vol par un nouvel arrivant.
 La liste des types MIME de `desktop::MIME_TYPES` doit être identique à la ligne `MimeType=` de
-`packaging/lumen400.desktop` (un test le vérifie dès que ce fichier existe).
+`packaging/400_media_player.desktop` (un test le vérifie dès que ce fichier existe).
 
 ## Conventions
 
-* `unsafe` : interdit dans l'intégralité du dépôt (`#![forbid(unsafe_code)]` actif sur `lumen400-core`, `lumen400-engine` et `lumen400`). Le moteur multimédia est 100 % pur Rust autonome, sans aucun appel FFI ni dépendance à FFmpeg (`docs/AUDIT.md`).
+* `unsafe` : interdit dans l'intégralité du dépôt (`#![forbid(unsafe_code)]` actif sur `400_media_player-core`, `400_media_player-engine` et `400_media_player`). Le moteur multimédia est 100 % pur Rust autonome, sans aucun appel FFI ni dépendance à FFmpeg (`docs/AUDIT.md`).
 * Rien ne bloque le thread d'interface : tout ce qui peut attendre (D-Bus, disque, réseau, veille) vit sur un thread dédié.
 * Chaque texte de l'interface existe en français **et** en anglais (macro `translations!` dans `i18n.rs`).
 * Un comportement corrigé = un test qui échoue avant la correction.

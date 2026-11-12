@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.400_media_player.400_media_player</id>
+  <name>400_media_player</name>
+  <summary>Modern, 100% standalone pure-Rust GPU-accelerated media player</summary>
+  <summary xml:lang="fr">Lecteur multimédia moderne 100 % Rust autonome accéléré par le GPU</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <launchable type="desktop-id">400_media_player.desktop</launchable>
+  <description>
+    <p>
+      400_media_player is an independent, 100% standalone media player written in safe Rust (#![forbid(unsafe_code)])
+      with wgpu, egui and cpal, featuring a lock-free audio master clock, GPU HDR10/HLG-to-SDR tone mapping,
+      native bwdif deinterlacing, a 10-band equalizer, WSOLA pitch-preserving playback speeds, and text/bitmap subtitles.
+    </p>
+  </description>
+  <provides>
+    <binary>400_media_player</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-11-01" />
+  </releases>
+</component>

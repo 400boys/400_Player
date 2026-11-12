@@ -1,0 +1,31 @@
+app-id: io.400_media_player.400_media_player
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: 400_media_player
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --socket=pulseaudio
+  - --device=dri
+  - --filesystem=host:ro
+  - --filesystem=xdg-pictures
+  - --talk-name=org.freedesktop.ScreenSaver
+  - --own-name=org.mpris.MediaPlayer2.media_player_400
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/400_media_player/cargo
+modules:
+  - name: 400_media_player
+    buildsystem: simple
+    build-commands:
+      - cargo build --release -p media_player_400 --locked
+      - PREFIX=/app ./packaging/install.sh
+    sources:
+      - type: dir
+        path: ../..
