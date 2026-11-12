@@ -26,23 +26,22 @@ pub fn data_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join(DIR_NAME))
 }
 
-/// Writes `bytes` to `path` atomically.
+/// Writes `bytes` to `path` safely.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        let _ = fs::create_dir_all(parent);
     }
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("state");
-    let tmp = path.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id()));
-    if fs::write(&tmp, bytes).is_ok() {
-        if fs::rename(&tmp, path).is_ok() {
-            return Ok(());
-        }
-        let _ = fs::remove_file(&tmp);
+    // Direct write first (avoids Windows MoveFileEx ACCESS_DENIED on existing files)
+    if let Ok(()) = fs::write(path, bytes) {
+        return Ok(());
     }
-    // Fallback: direct write if atomic rename is blocked by OS/file lock/antivirus.
+    // Fallback: reset readonly permission if set, then write
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(path, permissions);
+    }
     fs::write(path, bytes)
 }
 

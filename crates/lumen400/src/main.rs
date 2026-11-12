@@ -1,6 +1,7 @@
 //! Lumen400 — a modern, GPU-accelerated, low-latency media player.
 
 #![forbid(unsafe_code)]
+#![windows_subsystem = "windows"]
 
 mod actions;
 mod app;
