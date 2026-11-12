@@ -57,7 +57,7 @@ pub use lumen400_core::settings::Deinterlace;
 pub use player::{Player, SpectrumView};
 pub use probe::{LangPrefs, StreamSelection, probe};
 pub use shared::{EngineConfig, Event, Notice, PlayState, PlayerStats, SeekMode, Snapshot};
-pub use thumbs::{Thumbnail, hdr_to_sdr_rgba};
+pub use thumbs::{MediaPreview, Thumbnail, extract_media_preview, hdr_to_sdr_rgba};
 
 use std::sync::Once;
 

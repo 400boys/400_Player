@@ -105,10 +105,19 @@ impl LumenApp {
 
             // --- left side: title -----------------------------------------------------------------------
             if has_media {
-                let max_w = (right - bar.left() - 36.0).max(80.0);
+                // Back to list button
+                let back_r = Rect::from_min_size(pos2(bar.left() + 10.0, bar.top() + (BAR_HEIGHT - 32.0) * 0.5), vec2(32.0, 32.0));
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(back_r));
+                let btn = IconButton::new(icons::CARET_LEFT).size(32.0).tip("Retour à la liste (Échap)").glass();
+                if btn.show(&mut child, &p).clicked() {
+                    actions.push(Action::Stop);
+                }
+
+                let text_left = bar.left() + 48.0;
+                let max_w = (right - text_left - 16.0).max(80.0);
                 let title = self.display_title();
                 let painter = ui.painter();
-                let pos = pos2(bar.left() + 20.0, bar.top() + 14.0);
+                let pos = pos2(text_left, bar.top() + 14.0);
                 let shadow = single_line(painter, &title, FontId::new(15.0, fonts::semibold()), Color32::from_black_alpha(170), max_w);
                 let galley = single_line(painter, &title, FontId::new(15.0, fonts::semibold()), p.glass_text, max_w);
                 painter.galley(pos + vec2(0.0, 1.0), shadow, Color32::PLACEHOLDER);

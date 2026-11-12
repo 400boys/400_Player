@@ -70,13 +70,13 @@ impl LumenApp {
 
             // --- the four ways in (including Mode Avancé) ----------------------------------------
             let labels = [
-                (icons::FOLDER_OPEN, t(T::OpenFile), true, Some(Action::OpenFile)),
-                (icons::FILM_STRIP, t(T::OpenFolderShort), false, Some(Action::OpenFolder)),
+                (icons::FILE_VIDEO, t(T::OpenFile), true, Some(Action::OpenFile)),
+                (icons::FOLDER, t(T::OpenFolderShort), false, Some(Action::OpenFolder)),
                 (icons::LINK, t(T::OpenUrlShort), false, Some(Action::OpenUrl)),
                 (icons::SPARKLE, "Mode Avancé", false, None),
             ];
             let gap = 10.0;
-            let widths: Vec<f32> = labels.iter().map(|(i, l, ..)| button_width(ui, l, true) + if *i == icons::FOLDER_OPEN { 8.0 } else { 0.0 }).collect();
+            let widths: Vec<f32> = labels.iter().map(|(i, l, ..)| button_width(ui, l, true) + if *i == icons::FILE_VIDEO { 8.0 } else { 0.0 }).collect();
             let row_w: f32 = widths.iter().sum::<f32>() + gap * (labels.len() as f32 - 1.0);
             let (row, _) = ui.allocate_exact_size(vec2(col_w, 40.0), Sense::hover());
             let mut x = row.center().x - row_w * 0.5;

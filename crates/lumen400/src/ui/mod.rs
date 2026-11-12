@@ -146,10 +146,17 @@ impl LumenApp {
             self.wake_controls();
         }
 
-        // Escape closes the topmost layer, then leaves full screen.
+        // Escape closes the topmost layer, then returns to the list if playing, or leaves full screen.
         let escape = events.iter().any(|e| matches!(e, Event::Key { key: Key::Escape, pressed: true, repeat: false, .. }));
-        if escape && !self.dismiss_top_layer() && self.fullscreen {
-            self.set_fullscreen(false);
+        if escape && !self.dismiss_top_layer() {
+            if self.source.is_some() {
+                if self.fullscreen {
+                    self.set_fullscreen(false);
+                }
+                self.stop();
+            } else if self.fullscreen {
+                self.set_fullscreen(false);
+            }
         }
 
         // The palette shortcut works even while typing in the palette itself (it toggles it).
@@ -189,7 +196,11 @@ impl LumenApp {
         if !dropped.is_empty() {
             let inputs: Vec<String> = dropped.iter().map(|f| f.path().to_string_lossy().into_owned()).filter(|p| !p.is_empty()).collect();
             if !inputs.is_empty() {
-                self.open_inputs(inputs, modifiers.shift);
+                if inputs.len() == 1 && std::path::Path::new(&inputs[0]).is_dir() {
+                    self.open_folder_path(std::path::Path::new(&inputs[0]), modifiers.shift);
+                } else {
+                    self.open_inputs(inputs, modifiers.shift);
+                }
             }
         }
         let _ = now;

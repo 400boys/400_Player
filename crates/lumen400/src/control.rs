@@ -1093,8 +1093,97 @@ impl LumenApp {
     }
 
     // =============================================================================================
-    // Dialog answers
+    // Dialog answers & Folder scanning
     // =============================================================================================
+
+    pub fn open_folder_path(&mut self, path: &Path, append: bool) {
+        let found = scan_folder(path, true);
+        if found.is_empty() {
+            self.toast(ToastKind::Warning, "Aucun média trouvé dans ce dossier".to_owned(), None);
+            return;
+        }
+
+        self.remember_dir(Some(&path.to_string_lossy()));
+
+        // If something was playing, stop it so we show the library:
+        if self.source.is_some() {
+            self.stop();
+        }
+
+        // Set advanced mode and switch to Vidéos tab
+        self.settings.advanced_mode = true;
+        self.advanced_tab = crate::ui::advanced::AdvancedTab::Videos;
+        self.current_folder = Some(path.to_path_buf());
+
+        // Update playlist queue
+        if append {
+            self.playlist.extend(found.iter().map(|p| path_entry(p)));
+        } else {
+            self.playlist.clear();
+            self.playlist.extend(found.iter().map(|p| path_entry(p)));
+        }
+
+        let mut new_entries = Vec::new();
+        for p in &found {
+            let src = p.to_string_lossy().into_owned();
+            let entry = if let Some(hist) = self.history.entries().iter().find(|e| e.source == src) {
+                hist.clone()
+            } else {
+                let title = p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_owned());
+                lumen400_core::settings::HistoryEntry {
+                    source: src,
+                    title,
+                    position: 0.0,
+                    duration: 0.0,
+                    last_played: 0,
+                }
+            };
+            new_entries.push(entry);
+        }
+
+        if append {
+            self.folder_entries.extend(new_entries);
+        } else {
+            self.folder_entries = new_entries;
+        }
+
+        self.spawn_thumbnail_generation();
+        self.touch_settings();
+    }
+
+    pub fn spawn_thumbnail_generation(&mut self) {
+        self.thumb_stop.store(true, std::sync::atomic::Ordering::Release);
+        let next_gen = self.thumb_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.thumb_stop = stop.clone();
+        let tx = self.thumb_tx.clone();
+        let sources: Vec<String> = self.folder_entries.iter().map(|e| e.source.clone()).collect();
+        let ctx = self.ctx.clone();
+
+        std::thread::Builder::new()
+            .name("lumen400-folder-thumbs".into())
+            .spawn(move || {
+                for source in sources {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Some(preview) = lumen400_engine::extract_media_preview(&source, 2.0, stop.clone()) {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        let _ = tx.send(crate::app::ThumbResult {
+                            source,
+                            image: preview.image,
+                            duration: preview.duration,
+                            title: preview.title,
+                            generation: next_gen,
+                        });
+                        ctx.request_repaint();
+                    }
+                }
+            })
+            .ok();
+    }
 
     pub fn handle_answers(&mut self) {
         for answer in self.dialogs.poll() {
@@ -1103,7 +1192,7 @@ impl LumenApp {
                     let inputs = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
                     self.open_inputs(inputs, append);
                 }
-                Answer::Folder { path, append } => self.open_inputs(vec![path.to_string_lossy().into_owned()], append),
+                Answer::Folder { path, append } => self.open_folder_path(&path, append),
                 Answer::Subtitle(p) => self.load_subtitle_file(&p, false),
                 Answer::LoadPlaylist(p) => self.open_inputs(vec![p.to_string_lossy().into_owned()], false),
                 Answer::SavePlaylist(p) => self.save_playlist_to(&p),

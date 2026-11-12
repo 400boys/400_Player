@@ -458,6 +458,78 @@ pub(crate) fn tonemap_rgba(data: &mut [u8], color: ColorInfo) {
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// Single-frame preview extraction for libraries and folders
+// -------------------------------------------------------------------------------------------------
+
+/// Media preview information with an optional thumbnail picture, duration and title.
+#[derive(Clone, Debug)]
+pub struct MediaPreview {
+    pub image: Option<RgbaImage>,
+    pub duration: f64,
+    pub title: Option<String>,
+}
+
+/// Extracts a fast preview thumbnail, duration, and display title from `source`.
+pub fn extract_media_preview(source: &str, target_sec: f64, stop: Arc<AtomicBool>) -> Option<MediaPreview> {
+    if stop.load(Ordering::Relaxed) {
+        return None;
+    }
+    let mut input = open_input(source, stop.clone()).ok()?;
+    let mut info = describe(&input, source);
+    select_streams(&mut info, &StreamSelection::default(), &LangPrefs::default());
+    let duration = info.duration.unwrap_or(0.0);
+    let title = info.display_title();
+
+    // 1. Check for audio cover art
+    if let Some(cover) = crate::probe::cover_art(&input) {
+        return Some(MediaPreview {
+            image: Some(cover),
+            duration,
+            title,
+        });
+    }
+
+    // 2. Check for video stream
+    let Some(index) = info.selected_video else {
+        return Some(MediaPreview {
+            image: None,
+            duration,
+            title,
+        });
+    };
+
+    let start_offset = container_start_offset(&input);
+    let stream = input.stream(index)?;
+    let time_base = stream.time_base_sec();
+    let mut decoder = VideoDecoder::new(stream).ok()?;
+    decoder.skip_frame(DiscardMode::NonKey);
+    input.discard_except(&[index]);
+
+    let mut grabber = Grabber {
+        input,
+        decoder,
+        index,
+        time_base,
+        start_offset,
+        lead: 0.0,
+        stop,
+    };
+
+    let target = if duration > 2.0 {
+        (duration * 0.1).clamp(0.5, target_sec.max(2.0))
+    } else {
+        0.0
+    };
+
+    let image = grabber.grab(target, 5.0).or_else(|| grabber.grab(0.0, 10.0));
+    Some(MediaPreview {
+        image,
+        duration,
+        title,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

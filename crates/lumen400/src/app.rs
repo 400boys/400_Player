@@ -103,6 +103,16 @@ pub struct TrackKey {
     pub cover: Option<usize>,
 }
 
+/// Result of extracting a media preview in the background.
+#[derive(Debug)]
+pub struct ThumbResult {
+    pub source: String,
+    pub image: Option<RgbaImage>,
+    pub duration: f64,
+    pub title: Option<String>,
+    pub generation: u64,
+}
+
 /// The player.
 pub struct LumenApp {
     pub ctx: Context,
@@ -189,6 +199,13 @@ pub struct LumenApp {
     pub advanced_tab: crate::ui::advanced::AdvancedTab,
     pub advanced_search: String,
     pub advanced_favorites: std::collections::HashSet<String>,
+    pub folder_entries: Vec<lumen400_core::settings::HistoryEntry>,
+    pub current_folder: Option<std::path::PathBuf>,
+    pub library_thumbnails: std::collections::HashMap<String, TextureHandle>,
+    pub thumb_tx: std::sync::mpsc::Sender<ThumbResult>,
+    pub thumb_rx: std::sync::mpsc::Receiver<ThumbResult>,
+    pub thumb_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub thumb_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LumenApp {
@@ -235,6 +252,10 @@ impl LumenApp {
         let mut playlist = Playlist::new();
         playlist.set_repeat(settings.repeat);
         playlist.set_shuffle(settings.shuffle);
+
+        let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
+        let thumb_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let thumb_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let mut app = Self {
             dialogs: Dialogs::new(ctx.clone()),
@@ -306,6 +327,13 @@ impl LumenApp {
             advanced_tab: crate::ui::advanced::AdvancedTab::Home,
             advanced_search: String::new(),
             advanced_favorites: std::collections::HashSet::new(),
+            folder_entries: Vec::new(),
+            current_folder: None,
+            library_thumbnails: std::collections::HashMap::new(),
+            thumb_tx,
+            thumb_rx,
+            thumb_gen,
+            thumb_stop,
         };
 
         if let Some(path) = &cli.automation {
@@ -315,6 +343,12 @@ impl LumenApp {
             }
         }
         app.apply_cli(cli, false);
+        if app.settings.advanced_mode && let Some(last_dir) = app.settings.last_dir.clone() {
+            let path = std::path::PathBuf::from(last_dir);
+            if path.is_dir() {
+                app.open_folder_path(&path, false);
+            }
+        }
         app.update_title();
         app
     }
@@ -326,6 +360,7 @@ impl LumenApp {
         self.track_window(ctx);
         self.pump();
         self.handle_answers();
+        self.poll_thumbnails(ctx);
         self.expire_messages(now);
         if let Some(mut a) = self.automation.take() {
             a.step(ctx, self, now);
@@ -375,6 +410,43 @@ impl LumenApp {
             && now - o.born > crate::ui::osd::OSD_LIFETIME
         {
             self.osd = None;
+        }
+    }
+
+    /// Pulls generated folder thumbnails and metadata from the background worker.
+    pub fn poll_thumbnails(&mut self, ctx: &Context) {
+        let current_gen = self.thumb_gen.load(std::sync::atomic::Ordering::SeqCst);
+        let mut repainted = false;
+        while let Ok(res) = self.thumb_rx.try_recv() {
+            if res.generation != current_gen {
+                continue;
+            }
+            if let Some(img) = res.image {
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [img.width as usize, img.height as usize],
+                    &img.data,
+                );
+                let tex = ctx.load_texture(
+                    format!("lib-thumb-{}", self.library_thumbnails.len()),
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.library_thumbnails.insert(res.source.clone(), tex);
+            }
+            for entry in &mut self.folder_entries {
+                if entry.source == res.source {
+                    if entry.duration <= 0.0 && res.duration > 0.0 {
+                        entry.duration = res.duration;
+                    }
+                    if entry.title.is_none() && res.title.is_some() {
+                        entry.title = res.title.clone();
+                    }
+                }
+            }
+            repainted = true;
+        }
+        if repainted {
+            ctx.request_repaint();
         }
     }
 

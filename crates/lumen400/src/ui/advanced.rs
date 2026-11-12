@@ -240,7 +240,7 @@ impl LumenApp {
                     // Button: Ouvrir un fichier (primary accent button)
                     let btn_open = ui.add(
                         egui::Button::new(
-                            RichText::new(format!("{}  Ouvrir un fichier", icons::FOLDER_OPEN))
+                            RichText::new(format!("{}  Ouvrir un fichier", icons::FILE_VIDEO))
                                 .font(FontId::new(12.5, fonts::semibold()))
                                 .color(Color32::from_rgb(13, 17, 22)),
                         )
@@ -249,6 +249,23 @@ impl LumenApp {
                     );
                     if btn_open.clicked() {
                         action_open = Some(Action::OpenFile);
+                    }
+
+                    ui.add_space(6.0);
+
+                    // Button: Ouvrir un dossier (with 400_Player logo green hue)
+                    let logo_green = Color32::from_rgb(61, 230, 201);
+                    let btn_folder = ui.add(
+                        egui::Button::new(
+                            RichText::new(format!("{}  Ouvrir un dossier", icons::FOLDER))
+                                .font(FontId::new(12.5, fonts::semibold()))
+                                .color(Color32::from_rgb(13, 17, 22)),
+                        )
+                        .fill(logo_green)
+                        .corner_radius(CornerRadius::same(7))
+                    );
+                    if btn_folder.clicked() {
+                        action_open = Some(Action::OpenFolder);
                     }
 
                     ui.add_space(8.0);
@@ -447,7 +464,8 @@ impl LumenApp {
                                 for chunk in resumable.chunks(cols) {
                                     ui.horizontal(|ui| {
                                         for entry in chunk {
-                                            if let Some(src) = render_resume_card(ui, &p, entry, card_w) {
+                                            let thumb = self.library_thumbnails.get(&entry.source);
+                                            if let Some(src) = render_resume_card(ui, &p, entry, thumb, card_w) {
                                                 play_source = Some(src);
                                             }
                                             ui.add_space(14.0);
@@ -460,7 +478,11 @@ impl LumenApp {
                         }
 
                         // --- SECTION: VOTRE BIBLIOTHÈQUE / GRILLE DES MÉDIAS ---
-                        let all_entries = self.history.entries().to_vec();
+                        let all_entries: Vec<HistoryEntry> = if !self.folder_entries.is_empty() {
+                            self.folder_entries.clone()
+                        } else {
+                            self.history.entries().to_vec()
+                        };
                         let search_term = self.advanced_search.trim().to_lowercase();
 
                         let filtered: Vec<&HistoryEntry> = all_entries
@@ -486,10 +508,40 @@ impl LumenApp {
                         ui.horizontal(|ui| {
                             ui.add_space(24.0);
                             let sec_title = match self.advanced_tab {
-                                AdvancedTab::Home => "Votre bibliothèque",
-                                AdvancedTab::Videos => "Toutes vos vidéos",
-                                AdvancedTab::Music => "Votre musique",
-                                AdvancedTab::Favorites => "Vos favoris",
+                                AdvancedTab::Home => {
+                                    if let Some(folder) = &self.current_folder {
+                                        if let Some(name) = folder.file_name().and_then(|n| n.to_str()) {
+                                            format!("Dossier : {name}")
+                                        } else {
+                                            "Votre bibliothèque".to_owned()
+                                        }
+                                    } else {
+                                        "Votre bibliothèque".to_owned()
+                                    }
+                                }
+                                AdvancedTab::Videos => {
+                                    if let Some(folder) = &self.current_folder {
+                                        if let Some(name) = folder.file_name().and_then(|n| n.to_str()) {
+                                            format!("Vidéos — {name}")
+                                        } else {
+                                            "Toutes vos vidéos".to_owned()
+                                        }
+                                    } else {
+                                        "Toutes vos vidéos".to_owned()
+                                    }
+                                }
+                                AdvancedTab::Music => {
+                                    if let Some(folder) = &self.current_folder {
+                                        if let Some(name) = folder.file_name().and_then(|n| n.to_str()) {
+                                            format!("Musique — {name}")
+                                        } else {
+                                            "Votre musique".to_owned()
+                                        }
+                                    } else {
+                                        "Votre musique".to_owned()
+                                    }
+                                }
+                                AdvancedTab::Favorites => "Vos favoris".to_owned(),
                             };
                             ui.label(RichText::new(sec_title).font(FontId::new(18.0, fonts::bold())).color(p.text));
                             ui.add_space(8.0);
@@ -516,10 +568,15 @@ impl LumenApp {
                                     FontId::new(17.0, fonts::bold()),
                                     p.text,
                                 );
+                                let empty_hint = if self.current_folder.is_some() {
+                                    "Aucun média correspondant trouvé dans ce dossier."
+                                } else {
+                                    "Glissez des fichiers ici, ou cliquez sur « Ouvrir un dossier » pour commencer."
+                                };
                                 ui.painter().text(
                                     pos2(empty_r.center().x, empty_r.center().y + 8.0),
                                     Align2::CENTER_CENTER,
-                                    "Glissez des fichiers ici, ou cliquez sur « Ouvrir un fichier » pour commencer.",
+                                    empty_hint,
                                     FontId::new(12.5, fonts::medium()),
                                     p.text_dim,
                                 );
@@ -535,7 +592,8 @@ impl LumenApp {
                                     ui.add_space(24.0);
                                     for entry in chunk {
                                         let is_fav = self.advanced_favorites.contains(&entry.source);
-                                        let (played, fav_click) = render_media_card(ui, &p, entry, card_w, is_fav);
+                                        let thumb = self.library_thumbnails.get(&entry.source);
+                                        let (played, fav_click) = render_media_card(ui, &p, entry, thumb, card_w, is_fav);
                                         if let Some(src) = played {
                                             play_source = Some(src);
                                         }
@@ -559,7 +617,12 @@ impl LumenApp {
             self.run(act);
         }
         if let Some(src) = play_source {
-            self.open_inputs(vec![src], false);
+            if let Some(item) = self.playlist.items().iter().find(|i| i.source == src) {
+                let id = item.id;
+                self.play_item(id);
+            } else {
+                self.open_inputs(vec![src], false);
+            }
         }
         if let Some(src) = toggle_fav {
             if self.advanced_favorites.contains(&src) {
@@ -619,7 +682,7 @@ fn paint_emblem_logo(ui: &mut Ui, rect: Rect) {
 }
 
 /// Renders a card in the "Reprendre le fil" section.
-fn render_resume_card(ui: &mut Ui, p: &Palette, entry: &HistoryEntry, width: f32) -> Option<String> {
+fn render_resume_card(ui: &mut Ui, p: &Palette, entry: &HistoryEntry, thumb: Option<&egui::TextureHandle>, width: f32) -> Option<String> {
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 68.0), Sense::click());
     let hover = resp.hovered();
 
@@ -632,7 +695,15 @@ fn render_resume_card(ui: &mut Ui, p: &Palette, entry: &HistoryEntry, width: f32
     // Thumbnail tile
     let tile_r = Rect::from_min_size(pos2(rect.left() + 10.0, rect.top() + 10.0), vec2(48.0, 48.0));
     ui.painter().rect_filled(tile_r, CornerRadius::same(8), p.accent_faint);
-    ui.painter().text(tile_r.center(), Align2::CENTER_CENTER, icon.to_string(), FontId::new(20.0, fonts::icons()), p.accent);
+    if let Some(tex) = thumb {
+        ui.painter().image(tex.id(), tile_r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        if hover {
+            ui.painter().rect_filled(tile_r, CornerRadius::same(8), Color32::from_black_alpha(100));
+            ui.painter().text(tile_r.center(), Align2::CENTER_CENTER, icons::PLAY.to_string(), FontId::new(18.0, fonts::icons()), p.accent);
+        }
+    } else {
+        ui.painter().text(tile_r.center(), Align2::CENTER_CENTER, icon.to_string(), FontId::new(20.0, fonts::icons()), p.accent);
+    }
 
     let tx = tile_r.right() + 12.0;
     let title = entry.title.as_deref().unwrap_or_else(|| {
@@ -685,7 +756,14 @@ fn render_resume_card(ui: &mut Ui, p: &Palette, entry: &HistoryEntry, width: f32
 }
 
 /// Renders a media card in the library grid.
-fn render_media_card(ui: &mut Ui, p: &Palette, entry: &HistoryEntry, width: f32, is_fav: bool) -> (Option<String>, Option<String>) {
+fn render_media_card(
+    ui: &mut Ui,
+    p: &Palette,
+    entry: &HistoryEntry,
+    thumb: Option<&egui::TextureHandle>,
+    width: f32,
+    is_fav: bool,
+) -> (Option<String>, Option<String>) {
     let height = 156.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
     let hover = resp.hovered();
@@ -700,15 +778,48 @@ fn render_media_card(ui: &mut Ui, p: &Palette, entry: &HistoryEntry, width: f32,
     let thumb_bg = if is_audio { Color32::from_rgb(20, 28, 38) } else { Color32::from_rgb(18, 24, 32) };
     ui.painter().rect_filled(thumb_rect, CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 }, thumb_bg);
 
-    // Center icon or play button
-    let center_icon = if hover { icons::PLAY } else if is_audio { icons::MUSIC_NOTES } else { icons::FILM_STRIP };
-    ui.painter().text(
-        thumb_rect.center(),
-        Align2::CENTER_CENTER,
-        center_icon.to_string(),
-        FontId::new(if hover { 26.0 } else { 22.0 }, fonts::icons()),
-        if hover { p.accent } else { fade(p.text_dim, 0.8) },
-    );
+    if let Some(tex) = thumb {
+        let size = tex.size_vec2();
+        let uv = if size.x > 0.0 && size.y > 0.0 {
+            let aspect_img = size.x / size.y;
+            let aspect_rect = thumb_rect.width() / thumb_rect.height();
+            if aspect_img > aspect_rect {
+                let factor = aspect_rect / aspect_img;
+                let u_min = (1.0 - factor) * 0.5;
+                let u_max = 1.0 - u_min;
+                Rect::from_min_max(pos2(u_min, 0.0), pos2(u_max, 1.0))
+            } else {
+                let factor = aspect_img / aspect_rect;
+                let v_min = (1.0 - factor) * 0.5;
+                let v_max = 1.0 - v_min;
+                Rect::from_min_max(pos2(0.0, v_min), pos2(1.0, v_max))
+            }
+        } else {
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))
+        };
+        ui.painter().image(tex.id(), thumb_rect, uv, Color32::WHITE);
+
+        if hover {
+            ui.painter().rect_filled(thumb_rect, CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 }, Color32::from_black_alpha(110));
+            ui.painter().text(
+                thumb_rect.center(),
+                Align2::CENTER_CENTER,
+                icons::PLAY.to_string(),
+                FontId::new(28.0, fonts::icons()),
+                p.accent,
+            );
+        }
+    } else {
+        // Center icon or play button
+        let center_icon = if hover { icons::PLAY } else if is_audio { icons::MUSIC_NOTES } else { icons::FILM_STRIP };
+        ui.painter().text(
+            thumb_rect.center(),
+            Align2::CENTER_CENTER,
+            center_icon.to_string(),
+            FontId::new(if hover { 26.0 } else { 22.0 }, fonts::icons()),
+            if hover { p.accent } else { fade(p.text_dim, 0.8) },
+        );
+    }
 
     // Duration badge on bottom right of thumbnail
     if entry.duration > 0.0 {
@@ -742,7 +853,15 @@ fn render_media_card(ui: &mut Ui, p: &Palette, entry: &HistoryEntry, width: f32,
         if hover { p.accent } else { p.text },
     );
 
-    let sub_text = if is_audio { "Fichier audio" } else { "Fichier vidéo" };
+    let ext_label;
+    let sub_text = if is_audio {
+        "Fichier audio"
+    } else if let Some(ext) = Path::new(&entry.source).extension().and_then(|e| e.to_str()) {
+        ext_label = format!("Vidéo · {}", ext.to_uppercase());
+        ext_label.as_str()
+    } else {
+        "Fichier vidéo"
+    };
     ui.painter().text(
         pos2(rect.left() + 10.0, thumb_rect.bottom() + 28.0),
         Align2::LEFT_TOP,
