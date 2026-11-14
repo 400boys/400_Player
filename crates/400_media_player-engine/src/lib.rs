@@ -70,7 +70,7 @@ pub fn init() {
 
 /// The version string of the standalone native Rust A/V engine.
 pub fn engine_version() -> String {
-    format!("400_media_player Native 100% Pure-Rust A/V {} (0 FFmpeg, 0 DLL)", env!("CARGO_PKG_VERSION"))
+    format!("400_media_player Native Rmedia Engine {} (100% Pure-Rust, 0 FFmpeg, 0 DLL)", env!("CARGO_PKG_VERSION"))
 }
 
 /// Kept as an alias for [`engine_version`] for compatibility with external callers.

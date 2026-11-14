@@ -1,0 +1,15 @@
+[package]
+name = "rmedia-device"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Audio, video and virtual device I/O in 100% pure Rust (libavdevice reproduction)"
+
+[lints]
+workspace = true
+
+[dependencies]
+rmedia-util = { workspace = true }
+rmedia-codec = { workspace = true }
+rmedia-format = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "rmedia-swresample"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Audio resampling, sample format conversion, and channel matrix mixing in 100% pure Rust (libswresample reproduction)"
+
+[lints]
+workspace = true
+
+[dependencies]
+rmedia-util = { workspace = true }

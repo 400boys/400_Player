@@ -1,0 +1,13 @@
+[package]
+name = "rmedia-codec"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Bitstream parsers, entropy encoders/decoders, and audio/video/subtitle codecs in 100% pure Rust (libavcodec reproduction)"
+
+[lints]
+workspace = true
+
+[dependencies]
+rmedia-util = { workspace = true }

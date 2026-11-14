@@ -1,0 +1,12 @@
+[package]
+name = "rmedia-util"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core utilities, data structures, math, DSP, and crypto for Rmedia (100% pure Rust replacement for libavutil)"
+
+[lints]
+workspace = true
+
+[dependencies]

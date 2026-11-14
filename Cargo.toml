@@ -1,19 +1,66 @@
 [workspace]
 resolver = "3"
-members = ["crates/400_media_player-core", "crates/400_media_player-engine", "crates/400_media_player"]
+members = [
+    "crates/400_media_player-core",
+    "crates/400_media_player-engine",
+    "crates/400_media_player",
+    "crates/rmedia-util",
+    "crates/rmedia-codec",
+    "crates/rmedia-swscale",
+    "crates/rmedia-swresample",
+    "crates/rmedia-format",
+    "crates/rmedia-filter",
+    "crates/rmedia-device",
+    "crates/rmedia-tools",
+    "crates/rmedia",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["400_media_player contributors"]
-description = "400_media_player — a modern, 100% standalone pure-Rust GPU-accelerated media player."
-keywords = ["media-player", "video", "audio", "pure-rust", "wgpu"]
+description = "400_media_player — a modern, 100% standalone pure-Rust GPU-accelerated media player powered by Rmedia."
+keywords = ["media-player", "video", "audio", "pure-rust", "wgpu", "rmedia"]
 categories = ["multimedia::video", "multimedia::audio"]
+
+[workspace.lints.rust]
+unsafe_code = "allow"
+unused_imports = "allow"
+unused_variables = "allow"
+dead_code = "allow"
+unused_mut = "allow"
+
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+manual_swap = "allow"
+chunks_exact_to_as_chunks = "allow"
+manual_is_multiple_of = "allow"
+manual_div_ceil = "allow"
+field_reassign_with_default = "allow"
+suspicious_arithmetic_impl = "allow"
+manual_flatten = "allow"
+inconsistent_digit_grouping = "allow"
+collapsible_if = "allow"
+if_same_then_else = "allow"
+manual_range_contains = "allow"
+derivable_impls = "allow"
+unnecessary_min_or_max = "allow"
 
 [workspace.dependencies]
 media_player_400-core = { path = "crates/400_media_player-core" }
 media_player_400-engine = { path = "crates/400_media_player-engine" }
+
+rmedia = { path = "crates/rmedia" }
+rmedia-util = { path = "crates/rmedia-util" }
+rmedia-codec = { path = "crates/rmedia-codec" }
+rmedia-swscale = { path = "crates/rmedia-swscale" }
+rmedia-swresample = { path = "crates/rmedia-swresample" }
+rmedia-format = { path = "crates/rmedia-format" }
+rmedia-filter = { path = "crates/rmedia-filter" }
+rmedia-device = { path = "crates/rmedia-device" }
+rmedia-tools = { path = "crates/rmedia-tools" }
 
 anyhow = "1"
 thiserror = "2"

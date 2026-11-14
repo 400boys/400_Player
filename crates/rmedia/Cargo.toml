@@ -1,0 +1,19 @@
+[package]
+name = "rmedia"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Facade crate for Rmedia (100% pure Rust FFmpeg replacement)"
+
+[lints]
+workspace = true
+
+[dependencies]
+rmedia-util = { workspace = true }
+rmedia-codec = { workspace = true }
+rmedia-swscale = { workspace = true }
+rmedia-swresample = { workspace = true }
+rmedia-format = { workspace = true }
+rmedia-filter = { workspace = true }
+rmedia-device = { workspace = true }

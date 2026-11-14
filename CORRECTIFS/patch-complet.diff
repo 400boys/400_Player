@@ -1,0 +1,3553 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 96827df..6e978d8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1930,6 +1930,7 @@ dependencies = [
+  "rust_h264",
+  "rust_h265",
+  "rustfft",
++ "serde_json",
+  "thiserror 2.0.21",
+  "tracing",
+ ]
+diff --git a/crates/400_media_player-engine/Cargo.toml b/crates/400_media_player-engine/Cargo.toml
+index a0a0da2..2945453 100644
+--- a/crates/400_media_player-engine/Cargo.toml
++++ b/crates/400_media_player-engine/Cargo.toml
+@@ -30,3 +30,9 @@ oxideav-mpeg12video.workspace = true
+ oxideav-mpeg4video.workspace = true
+ oxideav-prores.workspace = true
+ bytemuck.workspace = true
++
++[features]
++nut_debug = []
++
++[dev-dependencies]
++serde_json.workspace = true
+diff --git a/crates/400_media_player-engine/src/codecs.rs b/crates/400_media_player-engine/src/codecs.rs
+index 9793a19..c068fa5 100644
+--- a/crates/400_media_player-engine/src/codecs.rs
++++ b/crates/400_media_player-engine/src/codecs.rs
+@@ -121,6 +121,8 @@ fn is_supported_audio_codec(codec: &str) -> bool {
+             | "pcm_alaw"
+             | "pcm_mulaw"
+             | "adpcm_ima_wav"
++            | "adpcm_ima_caf"
++            | "adpcm_ms"
+             | "dsd_lsbf"
+             | "dsd_msbf"
+             | "l4a1"
+@@ -337,10 +339,13 @@ impl VideoDecoder {
+                         while let Ok(OxideFrame::Video(vf)) = dec.receive_frame() {
+                             out.push(vf);
+                         }
++                    } else {
++                        out.clear();
++                        return Err(());
+                     }
+-                    out
++                    Ok(out)
+                 }));
+-                if let Ok(frames) = res {
++                if let Ok(Ok(frames)) = res {
+                     for vf in frames {
+                         self.has_reference = true;
+                         self.out_queue.push_back(oxide_video_to_raw(&self.stream, vf, pts));
+@@ -834,6 +839,9 @@ pub struct AudioDecoder {
+     stream: StreamDesc,
+     out_queue: VecDeque<RawAudioFrame>,
+     oxide_dec: Option<Box<dyn OxideDecoder>>,
++    /// MPEG-1 audio Layer I/II packets are routed here (`oxideav-mp1`), because the Layer III
++    /// decoder rejects them. Created lazily on the first such packet.
++    layer12_dec: Option<Box<dyn OxideDecoder>>,
+ }
+ 
+ impl AudioDecoder {
+@@ -855,12 +863,13 @@ impl AudioDecoder {
+             stream: stream.clone(),
+             out_queue: VecDeque::new(),
+             oxide_dec,
++            layer12_dec: None,
+         })
+     }
+ 
+     pub fn flush(&mut self) {
+         self.out_queue.clear();
+-        if let Some(dec) = self.oxide_dec.as_mut() {
++        for dec in self.oxide_dec.iter_mut().chain(self.layer12_dec.iter_mut()) {
+             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                 let _ = dec.reset();
+             }));
+@@ -881,7 +890,22 @@ impl AudioDecoder {
+             return Ok(());
+         }
+ 
+-        if let Some(dec) = self.oxide_dec.as_mut()
++        let dec: Option<&mut Box<dyn OxideDecoder>> = if self.oxide_dec.is_some() && !data.is_empty() {
++            match mpeg_audio_layer(data) {
++                // Layer I / II: the Layer III decoder rejects them; route to the mp1 decoder.
++                Some((false, _)) => {
++                    if self.layer12_dec.is_none() {
++                        self.layer12_dec = create_oxide_audio_decoder_for("mp1", &self.stream);
++                    }
++                    self.layer12_dec.as_mut().or(self.oxide_dec.as_mut())
++                }
++                _ => self.oxide_dec.as_mut(),
++            }
++        } else {
++            None
++        };
++
++        if let Some(dec) = dec
+             && !data.is_empty()
+         {
+             let pts = pkt.pts().or(pkt.dts());
+@@ -890,6 +914,8 @@ impl AudioDecoder {
+                 i64::from(self.stream.time_base.1.max(1)),
+             );
+             let payload = if self.stream.codec == "aac" {
++                // The oxideav-aac decoder only accepts ADTS/LOAS carriers: raw MP4/MKV AAC
++                // packets get an ADTS header built from the AudioSpecificConfig.
+                 ensure_aac_adts_frame(data, &self.stream.extra_data, self.stream.sample_rate, self.stream.channels)
+             } else {
+                 data.to_vec()
+@@ -912,12 +938,17 @@ impl AudioDecoder {
+                 }
+                 out
+             }));
+-            if let Ok(frames) = res {
+-                for af in frames {
+-                    if let Some(raw_af) = oxide_audio_to_raw(&self.stream, af, pts) {
+-                        self.out_queue.push_back(raw_af);
++            match res {
++                Ok(frames) => {
++                    for af in frames {
++                        if let Some(raw_af) = oxide_audio_to_raw(&self.stream, af, pts) {
++                            self.out_queue.push_back(raw_af);
++                        }
+                     }
+                 }
++                Err(_) => {
++                    return Err(EngineError::Decoder { codec: self.stream.codec.clone(), reason: "audio decoder panicked".into() });
++                }
+             }
+             return Ok(());
+         }
+@@ -928,7 +959,7 @@ impl AudioDecoder {
+     }
+ 
+     pub fn send_eof(&mut self) -> Result<()> {
+-        if let Some(dec) = self.oxide_dec.as_mut() {
++        for dec in self.oxide_dec.iter_mut().chain(self.layer12_dec.iter_mut()) {
+             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                 let mut out = Vec::new();
+                 let _ = dec.flush();
+@@ -953,6 +984,36 @@ impl AudioDecoder {
+     }
+ }
+ 
++/// MPEG-1 audio frame header probe: returns `Some((is_layer3, is_mpeg_audio))` for packets that
++/// start with a valid MPEG audio frame header.
++fn mpeg_audio_layer(data: &[u8]) -> Option<(bool, bool)> {
++    if data.len() < 4 || data[0] != 0xFF || (data[1] & 0xE0) != 0xE0 {
++        return None;
++    }
++    let version_bits = (data[1] >> 3) & 0x03;
++    if version_bits == 1 {
++        return None; // reserved version
++    }
++    let layer_bits = (data[1] >> 1) & 0x03;
++    if layer_bits == 0 {
++        return None; // reserved layer
++    }
++    let bitrate_idx = (data[2] >> 4) & 0x0F;
++    if bitrate_idx == 0x0F || bitrate_idx == 0 {
++        return None;
++    }
++    let sample_rate_idx = (data[2] >> 2) & 0x03;
++    if sample_rate_idx == 0x03 {
++        return None;
++    }
++    let emphasis = data[3] & 0x03;
++    if emphasis == 0x02 {
++        return None;
++    }
++    // layer bits: 11 = Layer I, 10 = Layer II, 01 = Layer III
++    Some((layer_bits == 0x01, true))
++}
++
+ fn create_oxide_audio_decoder(stream: &StreamDesc) -> Option<Box<dyn OxideDecoder>> {
+     let codec_id = match stream.codec.as_str() {
+         "eac3" | "ec-3" => "eac3",
+@@ -960,11 +1021,15 @@ fn create_oxide_audio_decoder(stream: &StreamDesc) -> Option<Box<dyn OxideDecode
+         "aac" | "mp4a" => "aac",
+         "opus" => "opus",
+         "vorbis" => "vorbis",
+-        "mp1" => "mp1",
+-        "mp2" => "mp2",
++        // oxideav-mp1 registers MPEG-1 audio and decodes Layer I *and* Layer II frames.
++        "mp1" | "mp2" => "mp1",
+         "mp3" => "mp3",
+         _ => return None,
+     };
++    create_oxide_audio_decoder_for(codec_id, stream)
++}
++
++fn create_oxide_audio_decoder_for(codec_id: &str, stream: &StreamDesc) -> Option<Box<dyn OxideDecoder>> {
+     let ctx = oxide_runtime();
+     let mut params = CodecParameters::audio(CodecId::new(codec_id));
+     params.sample_rate = Some(stream.sample_rate.max(8000));
+@@ -1168,7 +1233,9 @@ fn decode_audio_packet(stream: &StreamDesc, pkt: &MediaPacket) -> Result<RawAudi
+             let samples: Vec<f32> = data.iter().map(|&b| f32::from(mulaw_to_s16(b)) / 32768.0).collect();
+             Ok(RawAudioFrame { samples, channels: ch, sample_rate: sr, pts })
+         }
+-        "adpcm_ima_wav" => Ok(decode_ima_adpcm(data, ch, sr, pts)),
++        "adpcm_ima_wav" => Ok(decode_ima_adpcm_wav(data, stream.block_align, ch, sr, pts)),
++        "adpcm_ima_caf" => Ok(decode_ima_adpcm_caf(data, stream.block_align, ch, sr, pts)),
++        "adpcm_ms" => Ok(decode_ms_adpcm(data, stream.block_align, ch, sr, pts)),
+         "dsd_lsbf" | "dsd_msbf" => {
+             let samples: Vec<f32> = data.iter().map(|&b| (f32::from(b.count_ones() as u8) - 4.0) / 4.0).collect();
+             Ok(RawAudioFrame { samples, channels: ch, sample_rate: sr, pts })
+@@ -1210,45 +1277,215 @@ const IMA_STEP_TABLE: [i32; 89] = [
+ ];
+ const IMA_INDEX_TABLE: [i32; 16] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
+ 
+-fn decode_ima_adpcm(data: &[u8], ch: u16, sr: u32, pts: Option<i64>) -> RawAudioFrame {
++/// IMA ADPCM in WAV/AVI layout: packets are whole blocks (4-byte header per channel, then nibble
++/// bytes interleaved by channel). `block_align == 0` treats the packet as a single block.
++fn decode_ima_adpcm_wav(data: &[u8], block_align: u16, ch: u16, sr: u32, pts: Option<i64>) -> RawAudioFrame {
+     let ch_u = usize::from(ch.max(1));
+-    if data.len() < 4 * ch_u {
+-        return RawAudioFrame { samples: Vec::new(), channels: ch, sample_rate: sr, pts };
+-    }
+-    let mut pred = vec![0i32; ch_u];
+-    let mut idx = vec![0i32; ch_u];
+-    for c in 0..ch_u {
+-        pred[c] = i32::from(i16::from_le_bytes([data[c * 4], data[c * 4 + 1]]));
+-        idx[c] = i32::from(data[c * 4 + 2]).clamp(0, 88);
+-    }
++    let ba = usize::from(block_align.max((4 * ch_u + 1) as u16));
+     let mut samples = Vec::with_capacity(data.len() * 2);
+-    for (i, &byte) in data[4 * ch_u..].iter().enumerate() {
+-        let c = i % ch_u;
+-        for shift in [0, 4] {
+-            let nib = ((byte >> shift) & 0x0F) as usize;
+-            let step = IMA_STEP_TABLE[idx[c] as usize];
+-            let mut diff = step >> 3;
+-            if (nib & 1) != 0 {
+-                diff += step >> 2;
++    let mut off = 0usize;
++    while off + 4 * ch_u <= data.len() {
++        let block_len = if block_align == 0 { data.len() } else { ba.min(data.len() - off) };
++        if block_len < 4 * ch_u {
++            break;
++        }
++        let block = &data[off..off + block_len];
++        off += block_len;
++        let mut pred = vec![0i32; ch_u];
++        let mut idx = vec![0i32; ch_u];
++        for c in 0..ch_u {
++            pred[c] = i32::from(i16::from_le_bytes([block[c * 4], block[c * 4 + 1]]));
++            idx[c] = i32::from(block[c * 4 + 2]).clamp(0, 88);
++        }
++        // WAV IMA: nibble bytes round-robin across channels, low nibble first.
++        for (i, &byte) in block[4 * ch_u..].iter().enumerate() {
++            let c = i % ch_u;
++            for nib_u in [(byte & 0x0F) as usize, (byte >> 4) as usize] {
++                let step = IMA_STEP_TABLE[idx[c] as usize];
++                let mut diff = step >> 3;
++                if (nib_u & 1) != 0 {
++                    diff += step >> 2;
++                }
++                if (nib_u & 2) != 0 {
++                    diff += step >> 1;
++                }
++                if (nib_u & 4) != 0 {
++                    diff += step;
++                }
++                if (nib_u & 8) != 0 {
++                    pred[c] = (pred[c] - diff).clamp(-32768, 32767);
++                } else {
++                    pred[c] = (pred[c] + diff).clamp(-32768, 32767);
++                }
++                idx[c] = (idx[c] + IMA_INDEX_TABLE[nib_u]).clamp(0, 88);
++                samples.push(pred[c] as f32 / 32768.0);
+             }
+-            if (nib & 2) != 0 {
+-                diff += step >> 1;
++        }
++        if block_align == 0 {
++            break;
++        }
++    }
++    RawAudioFrame { samples, channels: ch, sample_rate: sr, pts }
++}
++
++
++/// Apple IMA4 inside CAF: packets of 34 bytes per channel (2-byte LE header = signed 9-bit
++/// predictor + 7-bit step index, then 32 nibble bytes, low nibble first, 64 samples).
++fn decode_ima_adpcm_caf(data: &[u8], block_align: u16, ch: u16, sr: u32, pts: Option<i64>) -> RawAudioFrame {
++    let ch_u = usize::from(ch.max(1));
++    let packet = usize::from(block_align).max(34 * ch_u);
++    let mut samples = Vec::with_capacity(data.len() * 2);
++    let mut off = 0usize;
++    while off + packet <= data.len() {
++        let pkt = &data[off..off + packet];
++        off += packet;
++        let mut frames_out = 0usize;
++        for c in 0..ch_u {
++            let hdr = &pkt[c * 34..c * 34 + 2];
++            let packed = u16::from_le_bytes([hdr[0], hdr[1]]) as u16 as i32;
++            let mut pred = ((packed << 23) >> 23); // sign-extend low 9 bits
++            let mut idx = (packed & 0x7F) as usize;
++            idx = idx.min(88);
++            for &byte in &pkt[c * 34 + 2..c * 34 + 34] {
++                for nib_u in [usize::from(byte & 0x0F), usize::from(byte >> 4)] {
++                    let step = IMA_STEP_TABLE[idx];
++                    let mut diff = step >> 3;
++                    if (nib_u & 1) != 0 {
++                        diff += step >> 2;
++                    }
++                    if (nib_u & 2) != 0 {
++                        diff += step >> 1;
++                    }
++                    if (nib_u & 4) != 0 {
++                        diff += step;
++                    }
++                    if (nib_u & 8) != 0 {
++                        pred = (pred - diff).clamp(-32768, 32767);
++                    } else {
++                        pred = (pred + diff).clamp(-32768, 32767);
++                    }
++                    idx = ((idx as i32) + IMA_INDEX_TABLE[nib_u]).clamp(0, 88) as usize;
++                    samples.push(pred as f32 / 32768.0);
++                    frames_out += 1;
++                }
+             }
+-            if (nib & 4) != 0 {
+-                diff += step;
++        }
++        // Interleave was per-channel; CAF packets decode channel-major, so re-interleave.
++        if ch_u > 1 && frames_out > 0 {
++            let per_ch = frames_out / ch_u;
++            let mut interleaved: Vec<f32> = Vec::with_capacity(samples.len());
++            let tail = samples.split_off(samples.len() - frames_out);
++            let start = samples.len();
++            let mut chans = Vec::with_capacity(ch_u);
++            for c in 0..ch_u {
++                chans.push(tail[c * per_ch..(c + 1) * per_ch].to_vec());
+             }
+-            if (nib & 8) != 0 {
+-                pred[c] = (pred[c] - diff).clamp(-32768, 32767);
+-            } else {
+-                pred[c] = (pred[c] + diff).clamp(-32768, 32767);
++            samples.truncate(start);
++            for f in 0..per_ch {
++                for c in 0..ch_u {
++                    samples.push(chans[c][f]);
++                }
+             }
+-            idx[c] = (idx[c] + IMA_INDEX_TABLE[nib]).clamp(0, 88);
+-            samples.push(pred[c] as f32 / 32768.0);
++        }
++        if block_align == 0 {
++            break;
+         }
+     }
+     RawAudioFrame { samples, channels: ch, sample_rate: sr, pts }
+ }
+ 
++/// Microsoft ADPCM (WAV/AVI): exact FFmpeg-compatible block decoder.
++const MS_ADAPT_COEFF1: [i32; 7] = [64, 128, 0, 48, 60, 115, 98];
++const MS_ADAPT_COEFF2: [i32; 7] = [0, -64, 0, 16, 0, -52, -58];
++const MS_ADAPTATION_TABLE: [i32; 16] = [
++    230, 230, 230, 230, 307, 409, 512, 614, 768, 614, 512, 409, 307, 230, 230, 230,
++];
++
++fn decode_ms_adpcm(data: &[u8], block_align: u16, ch: u16, sr: u32, pts: Option<i64>) -> RawAudioFrame {
++    let ch_u = usize::from(ch.max(1));
++    let ba = usize::from(block_align.max((7 * ch_u + 1) as u16));
++    let mut out = Vec::with_capacity(data.len() * 2);
++
++    #[derive(Clone, Copy)]
++    struct Ms {
++        coeff1: i32,
++        coeff2: i32,
++        delta: i32,
++        s1: i32,
++        s2: i32,
++    }
++    impl Ms {
++        #[inline]
++        fn nibble(&mut self, nib: u8) -> i32 {
++            let mut predictor = (self.s1 * self.coeff1 + self.s2 * self.coeff2) / 64;
++            predictor += i32::from(if nib & 0x08 != 0 { (nib as i32) - 0x10 } else { nib as i32 }) * self.delta;
++            self.s2 = self.s1;
++            self.s1 = predictor.clamp(-32768, 32767);
++            self.delta = ((MS_ADAPTATION_TABLE[usize::from(nib & 0x0F)] * self.delta) >> 8).clamp(16, i32::MAX / 768);
++            self.s1
++        }
++    }
++
++    let mut off = 0usize;
++    while off + 7 * ch_u <= data.len() {
++        let block_len = if block_align == 0 { data.len() } else { ba.min(data.len() - off) };
++        if block_len < 7 * ch_u {
++            break;
++        }
++        let block = &data[off..off + block_len];
++        off += block_len;
++
++        let mut state: Vec<Ms> = Vec::with_capacity(ch_u);
++        for c in 0..ch_u {
++            let p = usize::from(block[c * 7]).min(6);
++            state.push(Ms {
++                coeff1: MS_ADAPT_COEFF1[p],
++                coeff2: MS_ADAPT_COEFF2[p],
++                delta: i32::from(i16::from_le_bytes([block[c * 7 + 1], block[c * 7 + 2]])),
++                s1: i32::from(i16::from_le_bytes([block[c * 7 + 3], block[c * 7 + 4]])),
++                s2: i32::from(i16::from_le_bytes([block[c * 7 + 5], block[c * 7 + 6]])),
++            });
++        }
++        // The two initial samples are emitted before the nibble data.
++        for st in &state {
++            out.push(st.s2 as f32 / 32768.0);
++        }
++        for st in &state {
++            out.push(st.s1 as f32 / 32768.0);
++        }
++        let nibbles = &block[7 * ch_u..];
++        if ch_u <= 2 {
++            // Mono: two nibbles per byte; stereo: high nibble = ch0, low nibble = ch1 (FFmpeg layout).
++            for &byte in nibbles {
++                out.push((state[0].nibble(byte >> 4) as f32) / 32768.0);
++                if ch_u == 2 {
++                    out.push((state[1].nibble(byte & 0x0F) as f32) / 32768.0);
++                } else {
++                    out.push((state[0].nibble(byte & 0x0F) as f32) / 32768.0);
++                }
++            }
++        } else {
++            // Multi-channel: each channel has its own nibble section of `per_ch` bytes.
++            let per_ch = nibbles.len() / ch_u;
++            for n in 0..(per_ch * 2).max(1) {
++                for c in 0..ch_u {
++                    let idx0 = (n / 2) * ch_u + c;
++                    if idx0 >= nibbles.len() {
++                        continue;
++                    }
++                    let byte = nibbles[idx0];
++                    let nib = if n % 2 == 0 { byte >> 4 } else { byte & 0x0F };
++                    out.push((state[c].nibble(nib) as f32) / 32768.0);
++                }
++            }
++        }
++        if block_align == 0 {
++            break;
++        }
++    }
++    RawAudioFrame { samples: out, channels: ch, sample_rate: sr, pts }
++}
++
+ // =================================================================================================
+ // Full Native FLAC Subframe & Rice/Rice2 Decoder
+ // =================================================================================================
+diff --git a/crates/400_media_player-engine/src/container.rs b/crates/400_media_player-engine/src/container.rs
+index 795c6d1..4f07995 100644
+--- a/crates/400_media_player-engine/src/container.rs
++++ b/crates/400_media_player-engine/src/container.rs
+@@ -102,6 +102,8 @@ pub struct StreamDesc {
+     pub sample_rate: u32,
+     pub sample_fmt: String,
+     pub bits_per_sample: u16,
++    /// Compressed-audio block size in bytes (WAV/AVI ADPCM); 0 when not applicable.
++    pub block_align: u16,
+     pub is_text_sub: bool,
+     pub language: Option<String>,
+     pub title: Option<String>,
+@@ -140,6 +142,7 @@ impl Default for StreamDesc {
+             sample_rate: 48_000,
+             sample_fmt: "fltp".into(),
+             bits_per_sample: 16,
++            block_align: 0,
+             is_text_sub: true,
+             language: None,
+             title: None,
+@@ -840,6 +843,7 @@ fn try_decode_l4m0_index(bytes: &[u8], reader: MediaReader, file_len: u64) -> Op
+             sample_rate,
+             sample_fmt,
+             bits_per_sample,
++            block_align: 0,
+             is_text_sub,
+             language,
+             title,
+@@ -945,6 +949,7 @@ fn parse_wav_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput>
+     let mut bits_per_sample = 16u16;
+     let mut block_align = 4u16;
+     let mut audio_format = 1u16;
++    let mut samples_per_block: Option<u16> = None;
+     let mut rf64_data_size: Option<u64> = None;
+     let mut data_offset = 0u64;
+     let mut data_len = 0u64;
+@@ -973,6 +978,13 @@ fn parse_wav_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput>
+                 if audio_format == 0xFFFE && chunk.len() >= 26 {
+                     audio_format = u16::from_le_bytes([chunk[24], chunk[25]]);
+                 }
++                // ADPCM: the fmt extension carries wSamplesPerBlock.
++                if (audio_format == 2 || audio_format == 0x11) && chunk.len() >= 20 {
++                    let spb = u16::from_le_bytes([chunk[18], chunk[19]]);
++                    if spb > 0 {
++                        samples_per_block = Some(spb);
++                    }
++                }
+             }
+         } else if tag == b"data" {
+             if (is_rf64 || sz == 0xFFFF_FFFF)
+@@ -1004,24 +1016,54 @@ fn parse_wav_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput>
+         _ => ("pcm_s16le", "s16"),
+     };
+ 
++    let is_adpcm = codec == "adpcm_ms" || codec == "adpcm_ima_wav";
+     let bytes_per_frame = usize::from(block_align).max(usize::from(channels) * usize::from(bits_per_sample).div_ceil(8)).max(1) as u64;
+-    let total_frames = data_len / bytes_per_frame;
++    let (total_frames, frames_per_pkt, chunk_bytes, pkt_frames) = if is_adpcm {
++        // Duration/packets work in ADPCM blocks; wSamplesPerBlock from the fmt extension, or the
++        // standard block layout when absent.
++        let ch = usize::from(channels);
++        let ba = usize::from(block_align);
++        let derived = if codec == "adpcm_ms" {
++            ((ba.saturating_sub(7 * ch)) * 2 / ch.max(1)) + 2
++        } else {
++            ((ba.saturating_sub(4 * ch)) * 2 / ch.max(1)) + 1
++        };
++        let spb = usize::from(samples_per_block.unwrap_or(0)).max(derived).max(1);
++        let blocks = data_len / bytes_per_frame;
++        let blocks_per_pkt = ((u64::from(sample_rate) / 50).max(1) / u64::try_from(spb).unwrap_or(1)).clamp(1, 512);
++        (blocks * spb as u64, blocks_per_pkt * spb as u64, blocks_per_pkt * bytes_per_frame, spb as i64)
++    } else {
++        let frames = data_len / bytes_per_frame;
++        let fp = u64::from(sample_rate / 50).max(256);
++        (frames, fp, fp * bytes_per_frame, 1)
++    };
++
+     let duration = total_frames as f64 / f64::from(sample_rate);
+-    let frames_per_pkt = u64::from(sample_rate / 50).max(256);
+-    let chunk_bytes = frames_per_pkt * bytes_per_frame;
+ 
+     let mut entries = Vec::new();
+     let mut off = 0u64;
+     let mut frame_cursor = 0i64;
+     while off < data_len {
+         let len = (data_len - off).min(chunk_bytes);
+-        let fcount = (len / bytes_per_frame) as i64;
+-        if fcount == 0 {
+-            break;
++        if is_adpcm {
++            // Packets are whole ADPCM blocks; the last one may be shorter but must stay
++            // block-aligned (the decoder walks per-block).
++            let fcount = (len / bytes_per_frame) as i64 * pkt_frames;
++            if len == 0 {
++                break;
++            }
++            entries.push(PacketEntry::slice(0, Some(frame_cursor), Some(frame_cursor), fcount.max(1), true, data_offset + off, len as u32));
++            frame_cursor += fcount.max(1);
++            off += len;
++        } else {
++            let fcount = (len / bytes_per_frame) as i64;
++            if fcount == 0 {
++                break;
++            }
++            entries.push(PacketEntry::slice(0, Some(frame_cursor), Some(frame_cursor), fcount, true, data_offset + off, len as u32));
++            off += len;
++            frame_cursor += fcount;
+         }
+-        entries.push(PacketEntry::slice(0, Some(frame_cursor), Some(frame_cursor), fcount, true, data_offset + off, len as u32));
+-        off += len;
+-        frame_cursor += fcount;
+     }
+ 
+     let stream = StreamDesc {
+@@ -1034,6 +1076,7 @@ fn parse_wav_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput>
+         sample_rate,
+         sample_fmt: sample_fmt.into(),
+         bits_per_sample,
++        block_align: if is_adpcm { block_align } else { 0 },
+         bit_rate: Some(u64::from(sample_rate) * u64::from(channels) * u64::from(bits_per_sample)),
+         ..Default::default()
+     };
+@@ -1120,7 +1163,7 @@ fn parse_aiff_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput
+     }
+ 
+     let codec = match bits_per_sample {
+-        8 => "pcm_s8",
++        8 => "pcm_u8", // AIFF stores 8-bit samples unsigned
+         24 => "pcm_s24be",
+         32 => "pcm_s32be",
+         _ => "pcm_s16be",
+@@ -1551,7 +1594,14 @@ fn parse_stbl(stbl: &[u8], file_len: u64, st: &mut StreamDesc, pkts: &mut Vec<Pa
+                     }
+                     b"mp4v" => {
+                         st.kind = MediaKind::Video;
+-                        "mpeg4".into()
++                        // Refine via the esds objectTypeIndication (MJPEG-in-MP4 ships as mp4v).
++                        let esds_oti = if entry.len() > 86 { mp4_entry_esds_object_type(&entry[86..]) } else { None };
++                        match esds_oti {
++                            Some(0x6C) | Some(0x6D) => "mjpeg".into(),
++                            Some(0x60..=0x63) | Some(0x6B) => "mpeg2video".into(),
++                            Some(0x6A) => "mpeg1video".into(),
++                            _ => "mpeg4".into(),
++                        }
+                     }
+                     b"apch" | b"apcn" | b"apcs" | b"apco" | b"ap4h" => {
+                         st.kind = MediaKind::Video;
+@@ -1571,7 +1621,18 @@ fn parse_stbl(stbl: &[u8], file_len: u64, st: &mut StreamDesc, pkts: &mut Vec<Pa
+                     }
+                     b"mp4a" => {
+                         st.kind = MediaKind::Audio;
+-                        "aac".into()
++                        // mp4a can carry MP3 (OTI 0x69/0x6B) — refine from the esds child box.
++                        let ver = u16::from_be_bytes([entry[16], entry[17]]);
++                        let child_off = match ver {
++                            1 => 36 + 16,
++                            2 => 36 + 36,
++                            _ => 36,
++                        };
++                        let esds_oti = if entry.len() > child_off { mp4_entry_esds_object_type(&entry[child_off..]) } else { None };
++                        match esds_oti {
++                            Some(0x69) | Some(0x6B) => "mp3".into(),
++                            _ => "aac".into(),
++                        }
+                     }
+                     b"fLaC" => {
+                         st.kind = MediaKind::Audio;
+@@ -1597,7 +1658,11 @@ fn parse_stbl(stbl: &[u8], file_len: u64, st: &mut StreamDesc, pkts: &mut Vec<Pa
+                         st.kind = MediaKind::Audio;
+                         "mp3".into()
+                     }
+-                    b"twos" | b"sowt" | b"lpcm" => {
++                    b"twos" => {
++                        st.kind = MediaKind::Audio;
++                        "pcm_s16be".into()
++                    }
++                    b"sowt" | b"lpcm" => {
+                         st.kind = MediaKind::Audio;
+                         "pcm_s16le".into()
+                     }
+@@ -1828,6 +1893,80 @@ fn extract_mp4_sample_entry_extradata(mut b: &[u8]) -> Vec<u8> {
+     Vec::new()
+ }
+ 
++/// objectTypeIndication from an `esds` box (tag 0x04 DecoderConfigDescriptor's first byte).
++fn extract_esds_object_type(mut esds: &[u8]) -> Option<u8> {
++    if esds.len() < 4 {
++        return None;
++    }
++    esds = &esds[4..]; // skip version/flags
++    let read_len = |b: &[u8]| -> Option<(usize, usize)> {
++        let mut len = 0usize;
++        let mut count = 0usize;
++        let mut i = 0usize;
++        while i < b.len() {
++            let byte = usize::from(b[i]);
++            i += 1;
++            len = (len << 7) | (byte & 0x7F);
++            count += 1;
++            if byte & 0x80 == 0 {
++                break;
++            }
++            if count > 4 {
++                return None;
++            }
++        }
++        Some((len, i))
++    };
++    let (mut tag, mut body, mut l) = (0usize, 0usize, 0usize);
++    // Walk top-level descriptors looking for DecoderConfigDescriptor (0x04).
++    let mut pos = 0usize;
++    let mut depth = 0;
++    while pos < esds.len() && depth < 4 {
++        tag = usize::from(esds[pos]);
++        let (len, hdr) = read_len(&esds[pos + 1..])?;
++        body = pos + 1 + hdr;
++        l = len.min(esds.len() - body);
++        if tag == 0x03 {
++            // ES_Descriptor: ES_ID (2 bytes), then sub-descriptors.
++            let inner = &esds[body..body + l];
++            // ES_ID (2 bytes) + stream priority/flags byte (1).
++            let skip = if inner.len() > 3 { 3usize } else { 0 };
++            pos = 0;
++            esds = &inner[skip..];
++            depth += 1;
++            continue;
++        }
++        if tag == 0x04 {
++            return esds.get(body).copied();
++        }
++        pos = body + l;
++        let _ = (tag, body, l);
++    }
++    None
++}
++
++/// Finds the `esds` child box of a sample entry and returns its objectTypeIndication.
++fn mp4_entry_esds_object_type(mut b: &[u8]) -> Option<u8> {
++    while b.len() >= 8 {
++        let sz = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
++        if sz < 8 || sz > b.len() {
++            break;
++        }
++        let typ = &b[4..8];
++        let body = &b[8..sz];
++        if typ == b"esds" {
++            return extract_esds_object_type(body);
++        }
++        if typ == b"wave" || typ == b"esds" {
++            if let Some(oti) = mp4_entry_esds_object_type(body) {
++                return Some(oti);
++            }
++        }
++        b = &b[sz..];
++    }
++    None
++}
++
+ fn extract_esds_decoder_specific_info(esds: &[u8]) -> Option<Vec<u8>> {
+     // ISO/IEC 14496-1 ES_Descriptor: find tag 0x05 (DecoderSpecificInfo)
+     let mut i = 4usize; // skip version/flags
+@@ -2639,42 +2778,356 @@ fn read_uint_be(b: &[u8]) -> u64 {
+ // 6. AVI / OpenDML AVI (> 4 GB), MPEG-TS / M2TS, MPEG-PS / VOB, FLV, IVF, ASF/WMV, OGG, MP3/ADTS
+ // =================================================================================================
+ 
+-fn parse_avi_streaming(reader: MediaReader, _src: &str) -> Result<ContainerInput> {
++/// AVI / OpenDML AVI demuxer: real stream headers (`strl`), codecs from FourCCs, `idx1` index
++/// (or a linear `movi` walk when absent) and per-stream time bases.
++fn parse_avi_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput> {
++    const MAX_ENTRIES: usize = 4_000_000;
++    const IDX_WINDOW: usize = 4 << 20;
+     let file_len = reader.len();
+-    let hdr = reader.read_vec_at(0, 65536);
+-    let mut width = 640u32;
+-    let mut height = 360u32;
+-    let mut us_per_frame = 40_000u32;
+-    if let Some(avih) = hdr.windows(4).position(|w| w == b"avih")
+-        && hdr.len() >= avih + 48
+-    {
+-        let b = &hdr[avih + 8..];
+-        us_per_frame = u32::from_le_bytes([b[0], b[1], b[2], b[3]]).max(1000);
+-        width = u32::from_le_bytes([b[32], b[33], b[34], b[35]]).max(16);
+-        height = u32::from_le_bytes([b[36], b[37], b[38], b[39]]).max(16);
++    let head = reader.read_vec_at(0, (4 << 20).min(file_len as usize));
++
++    let fourcc_video_codec = |fcc: &[u8]| -> &'static str {
++        match std::str::from_utf8(fcc).unwrap_or("").trim_end() {
++            "XVID" | "xvid" | "DIVX" | "divx" | "DX50" | "MP4V" | "mp4v" | "FMP4" | "3IVX" | "3ivx" | "MP4S" => "mpeg4",
++            "H264" | "h264" | "X264" | "x264" | "AVC1" | "avc1" | "VSSH" | "DAVC" => "h264",
++            "HEVC" | "HVC1" | "hvc1" => "hevc",
++            "MJPEG" | "mjpg" | "MJPG" | "AVIJ" | "AVI1" | "AVI2" => "mjpeg",
++            "MPEG" | "mpg2" | "MPG2" | "MPG4" => "mpeg2video",
++            "WMV3" => "wmv3",
++            "WMV2" => "wmv2",
++            "WMV1" => "wmv1",
++            "VC1 " | "VC-1" => "vc1",
++            "DIV3" | "div3" | "MP43" | "mp43" | "MPG3" | "DIV4" => "msmpeg4v3",
++            "IV50" => "indeo5",
++            "IV41" | "IV40" => "indeo4",
++            "VP31" | "VP30" => "vp3",
++            "VP62" | "VP61" | "VP60" | "VP6A" | "VP6F" => "vp6",
++            "CRAM" | "cram" | "MSVC" | "msvc" => "msvideo1",
++            "YV12" | "I420" | "UYVY" | "YUY2" | "RGB " | "DIB " => "rawvideo",
++            _ => "mpeg4",
++        }
++    };
++    let wav_tag_codec = |tag: u16, bits: u16| -> (&'static str, &'static str) {
++        match tag {
++            1 => match bits {
++                8 => ("pcm_u8", "u8"),
++                24 => ("pcm_s24le", "s32"),
++                32 => ("pcm_s32le", "s32"),
++                _ => ("pcm_s16le", "s16"),
++            },
++            3 => ("pcm_f32le", "flt"),
++            6 => ("pcm_alaw", "s16"),
++            7 => ("pcm_mulaw", "s16"),
++            0x11 => ("adpcm_ima_wav", "s16"),
++            0x02 => ("adpcm_ms", "s16"),
++            0x55 => ("mp3", "s16"),
++            0x2000 => ("ac3", "flt"),
++            0x2001 => ("dts", "s16"),
++            0x00FF => ("aac", "s16"),
++            _ => ("pcm_s16le", "s16"),
++        }
++    };
++
++    struct AviStream {
++        kind: MediaKind,
++        codec: String,
++        sample_fmt: &'static str,
++        width: u32,
++        height: u32,
++        fps: Option<(u32, u32)>,
++        tb_num: i32,
++        tb_den: i32,
++        channels: u16,
++        sample_rate: u32,
++        bits: u16,
++        block_align: u16,
++        extra_data: Vec<u8>,
++        length: i64,
++    }
++    let mut avi_streams: Vec<AviStream> = Vec::new();
++    let mut movi_pos = None;
++    let mut idx1_pos = None;
++
++    // Walk the top-level RIFF structure: LIST hdrl → avih + strl (strh/strf), LIST movi, idx1.
++    let mut p = 12usize;
++    while p + 8 <= head.len() {
++        let tag = &head[p..p + 4];
++        let sz = usize::try_from(u32::from_le_bytes([head[p + 4], head[p + 5], head[p + 6], head[p + 7]])).unwrap_or(0);
++        if tag == b"LIST" && p + 12 <= head.len() {
++            let ltype = &head[p + 8..p + 12];
++            if ltype == b"hdrl" {
++                let mut q = p + 12;
++                let list_end = (p + 8 + sz).min(head.len());
++                while q + 8 <= list_end {
++                    let stag = &head[q..q + 4];
++                    let ssz = usize::try_from(u32::from_le_bytes([head[q + 4], head[q + 5], head[q + 6], head[q + 7]])).unwrap_or(0);
++                    let body = &head[q + 8..(q + 8 + ssz).min(head.len())];
++                    if stag == b"LIST" && body.len() >= 4 && &body[0..4] == b"strl" {
++                        let mut st = AviStream {
++                            kind: MediaKind::Video,
++                            codec: "mpeg4".into(),
++                            sample_fmt: "s16",
++                            width: 0,
++                            height: 0,
++                            fps: None,
++                            tb_num: 1,
++                            tb_den: 25,
++                            channels: 2,
++                            sample_rate: 48_000,
++                            bits: 16,
++                            block_align: 4,
++                            extra_data: Vec::new(),
++                            length: 0,
++                        };
++                        let mut r = 4usize;
++                        while r + 8 <= body.len() {
++                            let t2 = &body[r..r + 4];
++                            let s2 = usize::try_from(u32::from_le_bytes([body[r + 4], body[r + 5], body[r + 6], body[r + 7]])).unwrap_or(0);
++                            let b2 = &body[r + 8..(r + 8 + s2).min(body.len())];
++                            if t2 == b"strh" && b2.len() >= 40 {
++                                let fcc_type = &b2[0..4];
++                                st.kind = if fcc_type == b"vids" {
++                                    MediaKind::Video
++                                } else if fcc_type == b"auds" {
++                                    MediaKind::Audio
++                                } else {
++                                    MediaKind::Attachment
++                                };
++                                st.tb_num = i32::from_le_bytes([b2[20], b2[21], b2[22], b2[23]]).max(1); // dwScale
++                                st.tb_den = i32::from_le_bytes([b2[24], b2[25], b2[26], b2[27]]).max(1); // dwRate
++                                st.length = i64::from(u32::from_le_bytes([b2[32], b2[33], b2[34], b2[35]]));
++                                if st.kind == MediaKind::Video && st.tb_num > 0 {
++                                    st.fps = Some((u32::try_from(st.tb_den).unwrap_or(25), u32::try_from(st.tb_num).unwrap_or(1)));
++                                }
++                            } else if t2 == b"strf" && b2.len() >= 8 {
++                                if st.kind == MediaKind::Video && b2.len() >= 40 {
++                                    st.width = u32::from_le_bytes([b2[4], b2[5], b2[6], b2[7]]);
++                                    st.height = u32::from_le_bytes([b2[8], b2[9], b2[10], b2[11]]).max(1);
++                                    let compression = &b2[16..20];
++                                    if compression == [0, 0, 0, 0] {
++                                        st.codec = "rawvideo".into();
++                                    } else {
++                                        st.codec = fourcc_video_codec(compression).into();
++                                    }
++                                    // BITMAPINFOHEADER is not a codec extradata; codecs with
++                                    // in-band headers (Annex-B H.264, VOS/VOL MPEG-4) decode
++                                    // straight from the packets.
++                                    st.extra_data = Vec::new();
++                                } else if st.kind == MediaKind::Audio && b2.len() >= 16 {
++                                    let wtag = u16::from_le_bytes([b2[0], b2[1]]);
++                                    st.channels = u16::from_le_bytes([b2[2], b2[3]]).max(1);
++                                    st.sample_rate = u32::from_le_bytes([b2[4], b2[5], b2[6], b2[7]]);
++                                    st.block_align = u16::from_le_bytes([b2[12], b2[13]]).max(1);
++                                    st.bits = u16::from_le_bytes([b2[14], b2[15]]).max(8);
++                                    let (codec, fmt) = wav_tag_codec(wtag, st.bits);
++                                    st.codec = codec.into();
++                                    st.sample_fmt = fmt;
++                                }
++                            }
++                            r += 8 + s2 + (s2 & 1);
++                        }
++                        avi_streams.push(st);
++                    }
++                    q += 8 + ssz + (ssz & 1);
++                }
++            } else if ltype == b"movi" {
++                movi_pos = Some((p + 12) as u64);
++            }
++        } else if tag == b"idx1" {
++            idx1_pos = Some(p);
++            break;
++        }
++        p += 8 + sz + (sz & 1);
+     }
+-    let fps = (1_000_000 / us_per_frame).max(1);
+-    let stream = StreamDesc {
+-        index: 0,
+-        kind: MediaKind::Video,
+-        codec: "mpeg4".into(),
+-        time_base: (us_per_frame as i32, 1_000_000),
+-        width,
+-        height,
+-        fps: Some((fps, 1)),
+-        ..Default::default()
++
++    let Some(movi_start) = movi_pos else {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "AVI missing movi list".into() });
+     };
+-    let entries = vec![PacketEntry::slice(0, Some(0), Some(0), 1, true, 0, file_len.min(65536) as u32)];
++
++    let mut entries = Vec::new();
++    let mut seen_kinds = vec![false; avi_streams.len().max(1)];
++    let mut v_count = 0i64;
++    let mut a_count = 0i64;
++
++    fn push_chunk(
++        entries: &mut Vec<PacketEntry>,
++        streams: &[AviStream],
++        seen: &mut [bool],
++        v_count: &mut i64,
++        a_count: &mut i64,
++        st_idx: usize,
++        is_key: bool,
++        off: u64,
++        sz: u32,
++        video: bool,
++    ) {
++        let st = &streams[st_idx];
++        seen[st_idx] = true;
++        if video {
++            let pts = *v_count;
++            entries.push(PacketEntry::slice(st_idx, Some(pts), Some(pts), i64::from(st.tb_num.max(1)), is_key, off, sz));
++            *v_count += 1;
++        } else {
++            let frames = if st.block_align > 0 { i64::from(sz / u32::from(st.block_align)) } else { 1 };
++            let pts = *a_count;
++            entries.push(PacketEntry::slice(st_idx, Some(pts), Some(pts), frames.max(1), true, off, sz));
++            *a_count += frames.max(1);
++        }
++    }
++
++    let mut indexed = false;
++    if let Some(idx_pos) = idx1_pos {
++        let hdr = reader.read_vec_at(idx_pos as u64, 8);
++        if hdr.len() == 8 && &hdr[0..4] == b"idx1" {
++            let total = u64::from(u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]));
++            let n = (total / 16) as usize;
++            if total > 0 && n <= MAX_ENTRIES {
++                // Read the index in windows to avoid one seek per entry.
++                let mut window = Vec::new();
++                let mut win_start = 0u64;
++                for i in 0..n {
++                    let e_off = idx_pos as u64 + 8 + (i * 16) as u64;
++                    if window.is_empty() || e_off + 16 > win_start + window.len() as u64 {
++                        win_start = e_off;
++                        window = reader.read_vec_at(win_start, ((n - i).min(IDX_WINDOW / 16) * 16).max(16));
++                    }
++                    let rel = (e_off - win_start) as usize;
++                    if rel + 16 > window.len() {
++                        break;
++                    }
++                    let e = &window[rel..rel + 16];
++                    let ck = &e[0..4];
++                    // idx1 entry: dwChunkId, dwFlags (0x10 = keyframe), dwOffset (from movi),
++                    // dwSize.
++                    let flags = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
++                    let chunk_rel = u64::from(u32::from_le_bytes([e[8], e[9], e[10], e[11]]));
++                    let csz = u32::from_le_bytes([e[12], e[13], e[14], e[15]]);
++                    let st_num = usize::from(ck[1].saturating_sub(b'0'));
++                    if st_num >= avi_streams.len() {
++                        continue;
++                    }
++                    let is_video = ck[2] == b'd' && (ck[3] == b'c' || ck[3] == b'b');
++                    let is_audio = ck[2] == b'w' && ck[3] == b'b';
++                    if !is_video && !is_audio {
++                        continue;
++                    }
++                    let abs = movi_start + chunk_rel + 8;
++                    if abs >= file_len {
++                        continue;
++                    }
++                    let sz = (u64::from(csz)).min(file_len - abs) as u32;
++                    push_chunk(&mut entries, &avi_streams, &mut seen_kinds, &mut v_count, &mut a_count, st_num, flags & 0x10 != 0, abs, sz, is_video);
++                }
++                indexed = !entries.is_empty();
++            }
++        }
++    }
++
++    if !indexed {
++        // No usable index: walk the movi list sequentially.
++        let mut pos = movi_start;
++        while pos + 8 <= file_len && entries.len() < MAX_ENTRIES {
++            let h = reader.read_vec_at(pos, 8);
++            if h.len() < 8 {
++                break;
++            }
++            let sz = u64::from(u32::from_le_bytes([h[4], h[5], h[6], h[7]]));
++            let ck = &h[0..4];
++            if ck == b"idx1" {
++                break;
++            }
++            let st_num = usize::from(ck[1].saturating_sub(b'0'));
++            let is_video = ck[2] == b'd' && (ck[3] == b'c' || ck[3] == b'b');
++            let is_audio = ck[2] == b'w' && ck[3] == b'b';
++            if (is_video || is_audio) && st_num < avi_streams.len() {
++                let cap = (file_len - pos - 8).min(sz).min(u32::MAX as u64) as u32;
++                push_chunk(&mut entries, &avi_streams, &mut seen_kinds, &mut v_count, &mut a_count, st_num, is_video, pos + 8, cap, is_video);
++            }
++            pos += 8 + sz + (sz & 1);
++        }
++    }
++
++    if entries.is_empty() {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "AVI has no media chunks".into() });
++    }
++
++    // Compressed AVI video carries its codec configuration (MPEG-4 VOS/VO/VOL run, H.264
++    // Annex-B SPS/PPS…) split over the first video chunks. Feed those as extradata so the
++    // decoders are primed exactly like with a Matroska CodecPrivate.
++    for (avi_idx, st) in avi_streams.iter_mut().enumerate() {
++        if st.kind != MediaKind::Video || !st.extra_data.is_empty() {
++            continue;
++        }
++        let mut cfg = Vec::new();
++        for e in entries.iter().filter(|e| e.stream_index == avi_idx).take(3) {
++            let PacketPayload::Slice { offset, size } = &e.payload else { continue };
++            let head = reader.read_vec_at(*offset, (*size as usize).min(32 << 10));
++            if head.is_empty() {
++                break;
++            }
++            // Stop at the first VOP start code: everything before it is the codec
++            // configuration run (VOS/VO/VOL or Annex-B parameter sets).
++            let cut = head
++                .windows(4)
++                .position(|w| w == [0, 0, 1, 0xB6] || w == [0, 0, 1, 0x65] || w == [0, 0, 1, 0x41])
++                .unwrap_or(head.len());
++            cfg.extend_from_slice(&head[..cut]);
++            if cut < head.len() || cfg.len() >= 64 << 10 {
++                break;
++            }
++        }
++        st.extra_data = cfg;
++    }
++
++    let mut streams = Vec::new();
++    for (i, st) in avi_streams.iter().enumerate() {
++        if !seen_kinds.get(i).copied().unwrap_or(false) || st.kind == MediaKind::Attachment {
++            continue;
++        }
++        streams.push(StreamDesc {
++            index: i,
++            kind: st.kind,
++            codec: st.codec.clone(),
++            time_base: (st.tb_num.max(1), st.tb_den.max(1)),
++            width: st.width,
++            height: st.height,
++            fps: st.fps,
++            pix_fmt: Pixel::YUV420P,
++            channels: st.channels.max(1),
++            channel_layout: channel_layout_name(st.channels.max(1)),
++            sample_rate: st.sample_rate.max(8000),
++            sample_fmt: st.sample_fmt.into(),
++            bits_per_sample: st.bits.max(16),
++            extra_data: st.extra_data.clone(),
++            ..Default::default()
++        });
++    }
++    if streams.is_empty() {
++        return Err(EngineError::NoStreams(src.to_owned()));
++    }
++
++    let mut duration = 0.0f64;
++    for s in &streams {
++        let tb = s.time_base_sec();
++        let n = avi_streams[s.index].length.max(if s.kind == MediaKind::Video { v_count } else { a_count });
++        if n > 0 && tb > 0.0 {
++            duration = duration.max(n as f64 * tb);
++        }
++    }
++    if duration <= 0.0 {
++        duration = entries.iter().filter_map(|e| e.pts).map(|p| p as f64).fold(0.0f64, f64::max) + 1.0;
++    }
++
+     Ok(ContainerInput {
+         format_name: "avi".into(),
+-        duration: Some(10.0),
++        duration: Some(duration),
+         start_time: 0.0,
+         bit_rate: None,
+         size_bytes: Some(file_len),
+         seekable: true,
+         metadata: Vec::new(),
+         chapters: Vec::new(),
+-        streams: vec![stream],
++        streams,
+         cover_art_bytes: None,
+         program_stream_seek: false,
+         reader,
+@@ -2697,166 +3150,489 @@ fn parse_pes_pts(pes: &[u8]) -> Option<i64> {
+     }
+ }
+ 
+-fn parse_mpeg_ts_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput> {
+-    let file_len = reader.len();
+-    let probe = reader.read_vec_at(0, 65536);
+-    let (pkt_sz, sync_off) = if probe.len() >= 192 * 3 && probe[4] == 0x47 && probe[196] == 0x47 {
+-        (192u64, 4usize)
+-    } else {
+-        (188u64, 0usize)
+-    };
+-    let mut entries = Vec::new();
+-    let mut first_pts: Option<i64> = None;
+-    let mut last_pts: i64 = 0;
+-    let mut pos = 0u64;
+-    let max_scan = file_len.min(64 << 20);
+-    while pos + pkt_sz <= max_scan && entries.len() < 200_000 {
+-        let raw = reader.read_vec_at(pos, pkt_sz as usize);
+-        if raw.len() < pkt_sz as usize {
+-            break;
+-        }
+-        let ts = &raw[sync_off..];
+-        if ts[0] != 0x47 {
+-            pos += pkt_sz;
+-            continue;
++/// Reads a 5-byte MPEG-2/1 PTS field (`'00x0' marker + 33-bit value`).
++fn read_pts_field(b: &[u8]) -> Option<i64> {
++    if b.len() < 5 {
++        return None;
++    }
++    let p = ((i64::from(b[0] >> 1) & 0x07) << 30)
++        | (i64::from(b[1]) << 22)
++        | ((i64::from(b[2] >> 1) & 0x7F) << 15)
++        | (i64::from(b[3]) << 7)
++        | (i64::from(b[4] >> 1) & 0x7F);
++    Some(p)
++}
++
++/// MPEG-1 packet header PTS (ISO/IEC 11172-1 §2.4.1): the byte after the packet length tells the
++/// header shape; mirrors FFmpeg's `mpegps_read_packet` handling. Returns `(pts, header_bytes)`.
++fn mpeg1_pes_pts(payload: &[u8]) -> Option<(i64, usize)> {
++    let mut c = usize::from(*payload.first()?);
++    let mut off = 1usize;
++    if (c & 0xC0) == 0x40 {
++        // '01' prefix: buffer scale/size (2 bytes) precede the timestamps.
++        off += 2;
++        c = usize::from(*payload.get(off)?);
++        off += 1;
++    }
++    let pts = match c & 0xF0 {
++        // '0010': PTS only; '0011': PTS + DTS. FFmpeg reads PTS[32..30] from bits (c >> 1) & 0x07.
++        0x20 | 0x30 => {
++            Some(
++                ((i64::from(((c >> 1) & 0x07) as u32)) << 30)
++                    | (i64::from(*payload.get(off)?).checked_shl(22)?)
++                    | ((i64::from(*payload.get(off + 1)? >> 1) & 0x7F) << 15)
++                    | (i64::from(*payload.get(off + 2)?).checked_shl(7)?)
++                    | (i64::from(*payload.get(off + 3)? >> 1) & 0x7F),
++            )
+         }
+-        let pusi = (ts[1] & 0x40) != 0;
+-        let afc = (ts[3] >> 4) & 0x03;
+-        let mut pay_off = 4usize;
+-        if afc == 2 || afc == 0 {
+-            pos += pkt_sz;
+-            continue;
++        _ => None, // '0000 1111' and friends: no timestamp
++    };
++    let hdr_end = match c & 0xF0 {
++        0x20 => off + 4,
++        // PTS (4 bytes) + DTS prefix byte + DTS (4 bytes).
++        0x30 => off + 9,
++        _ => off,
++    };
++    Some((pts.unwrap_or(0), hdr_end))
++}
++
++/// AC-3 (and E-AC-3) syncword 0x0B 0x77; frame size per ATSC A/52 Table 5.18.
++/// Returns `(frame_bytes, sample_rate, channels, samples_per_frame)`.
++pub(crate) fn ac3_frame_header(data: &[u8]) -> Option<(usize /*bytes*/, u32 /*rate*/, u16 /*ch*/, u32 /*samples*/)> {
++    if data.len() < 7 || data[0] != 0x0B || data[1] != 0x77 {
++        return None;
++    }
++    const AC3_SAMPLE_RATES: [u32; 4] = [48_000, 44_100, 32_000, 0];
++    const AC3_CHANNELS: [u16; 8] = [2, 1, 2, 3, 3, 4, 3, 4];
++    const FRAME_SIZES: [[u16; 3]; 38] = [
++        [64, 69, 96], [64, 70, 96], [80, 87, 120], [80, 88, 120], [96, 104, 144], [96, 105, 144],
++        [112, 121, 168], [112, 122, 168], [128, 139, 192], [128, 140, 192], [160, 174, 240],
++        [160, 175, 240], [192, 208, 288], [192, 209, 288], [224, 243, 336], [224, 244, 336],
++        [256, 278, 384], [256, 279, 384], [320, 348, 480], [320, 349, 480], [384, 417, 576],
++        [384, 418, 576], [448, 487, 672], [448, 488, 672], [512, 557, 768], [512, 558, 768],
++        [640, 696, 960], [640, 697, 960], [768, 835, 1152], [768, 836, 1152], [896, 975, 1344],
++        [896, 976, 1344], [1024, 1114, 1536], [1024, 1115, 1536], [1152, 1253, 1728],
++        [1152, 1254, 1728], [1280, 1393, 1920], [1280, 1394, 1920],
++    ];
++    let b2 = data[2];
++    // bsid lives in the top 5 bits of byte 5: > 10 ⇒ E-AC-3 (FFmpeg `ff_ac3_parse_header`).
++    let bsid = (data[5] >> 3) & 0x1F;
++    if bsid > 10 {
++        // E-AC-3: strmtyp(2) substreamid(3) frmsiz(11) fscod(2) numblkscod(2)…
++        let frmsiz = ((u32::from(b2 >> 3) & 0x07) << 8) | u32::from(data[3]);
++        let fscod2 = usize::from((data[4] >> 6) & 0x03);
++        let rate = [48_000u32, 44_100, 32_000, 24_000][fscod2];
++        let bytes = ((frmsiz + 1) * 2) as usize;
++        let blocks = [1u32, 2, 3, 6][usize::from((data[4] >> 4) & 0x03)];
++        return Some((bytes, rate, 2, blocks * 256));
++    }
++    // AC-3: crc1 (2 bytes at [2..4]), then fscod(2) | frmsizecod(6) at byte 4; the size table is
++    // indexed by frmsizecod directly (0..37), not by code>>1.
++    let fscod = usize::from(data[4] >> 6);
++    let frmsizecod = usize::from(data[4] & 0x3F);
++    if fscod > 2 || frmsizecod > 37 {
++        return None;
++    }
++    let words = u32::from(FRAME_SIZES[frmsizecod][fscod]);
++    let rate = AC3_SAMPLE_RATES[fscod];
++    let b6 = data[6];
++    let acmod = usize::from((b6 >> 5) & 0x07);
++    let mut ch = AC3_CHANNELS[acmod];
++    let lfeon = if acmod == 2 { (b6 >> 2) & 0x01 } else { (b6 >> 4) & 0x01 };
++    if lfeon == 1 {
++        ch += 1; // LFE
++    }
++    Some(((words * 2) as usize, rate, ch, 1536))
++}
++
++/// DTS core frame: sync 0x7FFE8001, 14-bit frame size (bytes) at bits 32..45,
++/// sample rate code at bits 62..65.
++pub(crate) fn dts_frame_header(data: &[u8]) -> Option<(usize /*bytes*/, u32 /*rate*/, u16 /*ch*/, u32 /*samples*/)> {
++    if data.len() < 10 || data[0] != 0x7F || data[1] != 0xFE || data[2] != 0x80 || data[3] != 0x01 {
++        return None;
++    }
++    const DTS_RATES: [u32; 16] = [
++        8000, 16000, 32000, 64000, 128000, 22050, 44100, 88200, 176400, 352800, 12000, 24000,
++        48000, 96000, 192000, 384000,
++    ];
++    const DTS_CHANNELS: [u16; 16] = [1, 2, 2, 2, 3, 3, 4, 4, 5, 6, 6, 6, 7, 8, 8, 8];
++    let frame_size = ((u32::from(data[4]) << 6) | u32::from(data[5] >> 2)) as usize + 1;
++    if frame_size < 96 {
++        return None;
++    }
++    let sr_code = ((u32::from(data[7] & 0x03)) << 2) | u32::from(data[8] >> 6);
++    if sr_code > 14 || DTS_RATES[sr_code as usize] == 0 {
++        return None;
++    }
++    let amode = usize::from((data[8] >> 2) & 0x0F);
++    let npcmblocks = ((u32::from(data[6] & 0x3F)) << 1) | u32::from(data[7] >> 7);
++    let samples = npcmblocks.saturating_mul(32).max(1);
++    Some((frame_size, DTS_RATES[sr_code as usize], DTS_CHANNELS[amode.min(15)], samples))
++}
++
++/// Sniffs the codec of a private-stream-1 (DVD) payload.
++fn dvd_private_stream_codec(data: &[u8]) -> (MediaKind, &'static str, usize) {
++    let b0 = *data.first().unwrap_or(&0);
++    if b0 & 0xF8 == 0x80 {
++        // AC-3: substream 0x80..0x87, 3 header bytes, then A/52 frames.
++        let (sz, _, _, _) = ac3_frame_header(&data[4..]).unwrap_or((0, 0, 0, 0));
++        if sz > 0 {
++            return (MediaKind::Audio, "ac3", 4);
+         }
+-        if afc == 3 && pay_off < ts.len() {
+-            pay_off += 1 + usize::from(ts[4]);
++    }
++    if b0 & 0xF8 == 0x88 {
++        // DTS: substream 0x88..0x8F.
++        let (sz, _, _, _) = dts_frame_header(&data[4..]).unwrap_or((0, 0, 0, 0));
++        if sz > 0 {
++            return (MediaKind::Audio, "dts", 4);
+         }
+-        let pid = ((u16::from(ts[1] & 0x1F)) << 8) | u16::from(ts[2]);
+-        if pusi && pay_off + 14 <= ts.len() {
+-            let pay = &ts[pay_off..];
+-            if pay.starts_with(&[0x00, 0x00, 0x01]) {
+-                let sid = pay[3];
+-                let s_idx = if (0xE0..=0xEF).contains(&sid) {
+-                    Some(0usize)
+-                } else if (0xC0..=0xDF).contains(&sid) || sid == 0xBD {
+-                    Some(1usize)
+-                } else {
+-                    None
+-                };
+-                if let Some(idx) = s_idx {
+-                    let pts = parse_pes_pts(pay).unwrap_or(last_pts);
+-                    if first_pts.is_none() {
+-                        first_pts = Some(pts);
++    }
++    if b0 & 0xF8 == 0xA0 {
++        // DVD LPCM: 0xA0 + 6 header bytes then big-endian PCM.
++        return (MediaKind::Audio, "pcm_s16be", 7);
++    }
++    if b0 & 0xE0 == 0x20 {
++        return (MediaKind::Subtitle, "dvd_subtitle", 1);
++    }
++    (MediaKind::Audio, "mp2", 0)
++}
++
++/// MPEG audio (Layer I/II/III) codec label from a frame header.
++fn mpeg_audio_codec_label(data: &[u8]) -> Option<&'static str> {
++    if data.len() < 4 || data[0] != 0xFF || (data[1] & 0xE0) != 0xE0 {
++        return None;
++    }
++    let layer = (data[1] >> 1) & 0x03;
++    let bitrate = (data[2] >> 4) & 0x0F;
++    let srate = (data[2] >> 2) & 0x03;
++    if layer == 0 || bitrate == 0 || bitrate == 0x0F || srate == 3 {
++        return None;
++    }
++    Some(match layer {
++        0x01 => "mp3",
++        _ => "mp2",
++    })
++}
++
++/// Parses an MPEG-1/2 video sequence header: (width, height, fps, is_mpeg2_extension_present).
++fn mpeg_video_sequence_info(es: &[u8]) -> (u32, u32, (u32, u32), bool) {
++    const FPS_TABLE: [(u32, u32); 8] = [(24000, 1001), (24, 1), (25, 1), (30000, 1001), (30, 1), (50, 1), (60000, 1001), (60, 1)];
++    let mut w = 0u32;
++    let mut h = 0u32;
++    let mut fps = (25u32, 1u32);
++    let mut mpeg2 = false;
++    let mut i = 0usize;
++    while i + 4 <= es.len() {
++        if es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 1 {
++            let code = es[i + 3];
++            if code == 0xB3 && i + 12 <= es.len() {
++                // horizontal_size (12), vertical_size (12), aspect (4), frame_rate_code (4)
++                let w12 = (u32::from(es[i + 4]) << 4) | u32::from(es[i + 5] >> 4);
++                let h12 = (u32::from(es[i + 5] & 0x0F) << 8) | u32::from(es[i + 6]);
++                let frc = usize::from(es[i + 7] & 0x0F);
++                if w12 > 0 && h12 > 0 {
++                    w = w12;
++                    h = h12;
++                }
++                if (1..=8).contains(&frc) {
++                    fps = FPS_TABLE[frc - 1];
++                }
++                // The extension that follows a MPEG-2 sequence header marks MPEG-2 video.
++                let mut j = i + 12;
++                for _ in 0..64 {
++                    if j + 4 > es.len() {
++                        break;
+                     }
+-                    last_pts = last_pts.max(pts);
+-                    let hdr_len = (9 + usize::from(*pay.get(8).unwrap_or(&0))).min(pay.len());
+-                    let first_chunk = &pay[hdr_len..];
+-                    // Reassemble continuation TS packets belonging to the same PID until next PUSI
+-                    let mut assembled = Vec::from(first_chunk);
+-                    let mut look = pos + pkt_sz;
+-                    let look_limit = (pos + (2 << 20)).min(max_scan);
+-                    while look + pkt_sz <= look_limit {
+-                        let next_raw = reader.read_vec_at(look, pkt_sz as usize);
+-                        if next_raw.len() < pkt_sz as usize {
+-                            break;
+-                        }
+-                        let nts = &next_raw[sync_off..];
+-                        if nts[0] != 0x47 {
+-                            look += pkt_sz;
+-                            continue;
+-                        }
+-                        let npid = ((u16::from(nts[1] & 0x1F)) << 8) | u16::from(nts[2]);
+-                        if npid != pid {
+-                            look += pkt_sz;
+-                            continue;
+-                        }
+-                        if (nts[1] & 0x40) != 0 {
+-                            break;
+-                        }
+-                        let nafc = (nts[3] >> 4) & 0x03;
+-                        let mut npay_off = 4usize;
+-                        if nafc == 3 && npay_off < nts.len() {
+-                            npay_off += 1 + usize::from(nts[4]);
++                    if es[j] == 0 && es[j + 1] == 0 && es[j + 2] == 1 {
++                        if es[j + 3] == 0xB5 {
++                            mpeg2 = true;
+                         }
+-                        if (nafc == 1 || nafc == 3) && npay_off < nts.len() {
+-                            assembled.extend_from_slice(&nts[npay_off..]);
+-                        }
+-                        look += pkt_sz;
++                        break;
+                     }
+-                    entries.push(PacketEntry::inline(idx, Some(pts), Some(pts), 3600, idx == 0, assembled));
++                    j += 1;
+                 }
++                break;
+             }
++            i += 3;
++        } else {
++            i += 1;
+         }
+-        pos += pkt_sz;
+-    }
+-    if entries.is_empty() {
+-        return Err(EngineError::Open { input: src.to_owned(), reason: "MPEG-TS stream has no decodable PES packets".into() });
+     }
+-    let start_ticks = first_pts.unwrap_or(0);
+-    let start_time = start_ticks as f64 / 90_000.0;
+-    let duration = Some(((last_pts - start_ticks).max(3600) as f64) / 90_000.0);
+-    let streams = vec![
+-        StreamDesc { index: 0, kind: MediaKind::Video, codec: "h264".into(), time_base: (1, 90_000), width: 1920, height: 1080, fps: Some((25, 1)), ..Default::default() },
+-        StreamDesc { index: 1, kind: MediaKind::Audio, codec: "aac".into(), time_base: (1, 90_000), channels: 2, sample_rate: 48_000, ..Default::default() },
+-    ];
+-    Ok(ContainerInput {
+-        format_name: "mpegts".into(),
+-        duration,
+-        start_time,
+-        bit_rate: None,
+-        size_bytes: Some(file_len),
+-        seekable: true,
+-        metadata: Vec::new(),
+-        chapters: Vec::new(),
+-        streams,
+-        cover_art_bytes: None,
+-        program_stream_seek: false,
+-        reader,
+-        entries,
+-        cursor: 0,
+-        mkv_state: None,
+-    })
++    (w, h, fps, mpeg2)
+ }
+ 
++/// MPEG-PS (`.mpg`, `.mpeg`, `.vob`, DVD) demuxer: handles both the ISO 11172-1 (MPEG-1 packet
++/// headers) and ISO 13818-1 (MPEG-2 PES) layouts, real stream codecs, real dimensions and the DVD
++/// private-stream-1 audio substreams (AC-3, DTS, LPCM).
+ fn parse_mpeg_ps_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput> {
++    const MAX_SCAN: u64 = 8 << 30; // 8 GiB: DVD master copies
++    const MAX_ENTRIES: usize = 2_000_000;
+     let file_len = reader.len();
+-    let max_scan = file_len.min(32 << 20) as usize;
+-    let buf = reader.read_vec_at(0, max_scan);
++    let scan_len = file_len.min(MAX_SCAN);
+     let mut entries = Vec::new();
++    let mut first_pts = None;
+     let mut last_pts = 0i64;
+-    let mut i = 0usize;
+-    while i + 14 <= buf.len() {
+-        if buf[i] == 0x00 && buf[i + 1] == 0x00 && buf[i + 2] == 0x01 {
+-            let sid = buf[i + 3];
+-            if (0xE0..=0xEF).contains(&sid) || (0xC0..=0xDF).contains(&sid) {
+-                let pkt_len = usize::from(u16::from_be_bytes([buf[i + 4], buf[i + 5]]));
+-                let pes = &buf[i..];
+-                let pts = parse_pes_pts(pes).unwrap_or(last_pts);
+-                last_pts = last_pts.max(pts);
+-                let hdr_len = 9 + usize::from(*pes.get(8).unwrap_or(&0));
+-                if pkt_len > hdr_len && i + 6 + pkt_len <= buf.len() {
+-                    let s_idx = usize::from(!(0xE0..=0xEF).contains(&sid));
+-                    let data_off = (i + 6 + hdr_len) as u64;
+-                    let data_sz = (pkt_len - hdr_len) as u32;
+-                    entries.push(PacketEntry::slice(s_idx, Some(pts), Some(pts), 3600, true, data_off, data_sz));
+-                    i += 6 + pkt_len;
+-                    continue;
+-                }
++    let mut pos = 0u64;
++    let mut buf_off = 0u64;
++    let mut buf = reader.read_vec_at(0, 1 << 20);
++    let mut v_sid_seen = false;
++    let mut a_sid_seen = false;
++
++    // Keeps a rolling 1 MiB window of the file around `pos`.
++    fn ensure(buf: &mut Vec<u8>, buf_off: &mut u64, pos: u64, need: usize, reader: &MediaReader, scan_len: u64) -> bool {
++        if pos + need as u64 > *buf_off + buf.len() as u64 {
++            if pos + need as u64 > scan_len {
++                return false;
++            }
++            *buf_off = pos;
++            let sz = need.next_power_of_two().max(1 << 20);
++            *buf = reader.read_vec_at(pos, sz as usize);
++            return buf.len() >= need;
++        }
++        true
++    }
++
++    while pos + 6 <= scan_len && entries.len() < MAX_ENTRIES {
++        if !ensure(&mut buf, &mut buf_off, pos, 16, &reader, scan_len) {
++            break;
++        }
++        let rel = (pos - buf_off) as usize;
++        if buf[rel] != 0 || buf[rel + 1] != 0 || buf[rel + 2] != 1 {
++            pos += 1;
++            continue;
++        }
++        let sid = buf[rel + 3];
++        match sid {
++            0xBA => {
++                // Pack header: MPEG-1 = 12 bytes, MPEG-2 = 14 + stuffing.
++                let mpeg2_pack = buf[rel + 4] & 0xC0 == 0x44;
++                let pack_len = if mpeg2_pack {
++                    let n = 14 + usize::from(buf[rel + 13] & 0x07);
++                    n
++                } else {
++                    12
++                };
++                pos += pack_len as u64;
++                continue;
++            }
++            0xBB | 0xBC | 0xBE | 0xBF | 0xFF => {
++                // System header / program map / padding / private-2 / filler: length-prefixed skip.
++                if !ensure(&mut buf, &mut buf_off, pos + 4, 2, &reader, scan_len) {
++                    break;
++                }
++                let r2 = (pos + 4 - buf_off) as usize;
++                let sz = (u64::from(buf[r2]) << 8) | u64::from(buf[r2 + 1]);
++                pos += 6 + sz;
++                continue;
++            }
++            0xE0..=0xEF | 0xC0..=0xDF | 0xBD => {
++                let is_video = (0xE0..=0xEF).contains(&sid);
++                let is_private = sid == 0xBD;
++                if !ensure(&mut buf, &mut buf_off, pos, 16, &reader, scan_len) {
++                    break;
++                }
++                let r = (pos - buf_off) as usize;
++                let pkt_len = usize::from(u16::from_be_bytes([buf[r + 4], buf[r + 5]]));
++                let pkt_total = 6 + pkt_len;
++                if pkt_total < 9 {
++                    pos += 1;
++                    continue;
++                }
++                let mpeg2_pes = buf[r + 6] & 0xC0 == 0x80;
++                let (pts, data_rel) = if mpeg2_pes {
++                    let hdl = usize::from(buf[r + 8]);
++                    let pts = if (buf[r + 7] & 0x80) != 0 {
++                        read_pts_field(&buf[r + 9..r + 9 + 5])
++                    } else {
++                        None
++                    };
++                    (pts, r + 9 + hdl)
++                } else {
++                    // MPEG-1 packet: timestamps inside the payload prefix.
++                    let payload = &buf[r + 6..(r + pkt_total).min(buf.len())];
++                    match mpeg1_pes_pts(payload) {
++                        Some((p, hdr_end)) => (if p > 0 { Some(p) } else { None }, r + 6 + hdr_end),
++                        None => (None, r + 6),
++                    }
++                };
++                if pts.is_none() || !ensure(&mut buf, &mut buf_off, pos, pkt_total, &reader, scan_len) {
++                    // Unreadable/oversized header: skip to the next resync opportunity.
++                    pos += pkt_total as u64;
++                    continue;
++                }
++                if data_rel >= (r + pkt_total).min(buf.len()) {
++                    pos += pkt_total as u64;
++                    continue;
++                }
++                let data_sz = pkt_total - (data_rel - r);
++                let data_off = pos + (data_rel - r) as u64;
++                let (kind, _codec, data_skip) = if is_video {
++                    v_sid_seen = true;
++                    (MediaKind::Video, "mpegvideo", 0)
++                } else if is_private {
++                    let priv_rel = data_rel + 1;
++                    if priv_rel < buf.len() {
++                        let (k, c, s) = dvd_private_stream_codec(&buf[priv_rel..]);
++                        if k == MediaKind::Audio {
++                            a_sid_seen = true;
++                        }
++                        (k, c, s)
++                    } else {
++                        pos += pkt_total as u64;
++                        continue;
++                    }
++                } else {
++                    a_sid_seen = true;
++                    let head = &buf[data_rel..(data_rel + 16).min(buf.len())];
++                    (MediaKind::Audio, mpeg_audio_codec_label(head).unwrap_or("mp2"), 0)
++                };
++                if let Some(p) = pts {
++                    if first_pts.is_none() {
++                        first_pts = Some(p);
++                    }
++                    last_pts = last_pts.max(p);
++                }
++                let s_idx = if kind == MediaKind::Video { 0usize } else { 1usize };
++                if kind == MediaKind::Audio && !a_sid_seen {
++                    pos += pkt_total as u64;
++                    continue;
++                }
++                let payload_off = data_off + data_skip as u64;
++                if data_sz > data_skip && payload_off + (data_sz - data_skip) as u64 <= file_len && kind != MediaKind::Subtitle {
++                    entries.push(PacketEntry::slice(s_idx, pts, pts, 3600, true, payload_off, (data_sz - data_skip) as u32));
++                }
++                pos += pkt_total as u64;
++            }
++            _ => {
++                pos += 1;
+             }
+         }
+-        i += 1;
+     }
++
+     if entries.is_empty() {
+         return Err(EngineError::Open { input: src.to_owned(), reason: "MPEG-PS stream has no valid PES packs".into() });
+     }
+-    let duration = Some((last_pts.max(3600) as f64) / 90_000.0);
+-    let streams = vec![
+-        StreamDesc { index: 0, kind: MediaKind::Video, codec: "mpeg2video".into(), time_base: (1, 90_000), width: 720, height: 576, fps: Some((25, 1)), ..Default::default() },
+-        StreamDesc { index: 1, kind: MediaKind::Audio, codec: "mp2".into(), time_base: (1, 90_000), channels: 2, sample_rate: 48_000, ..Default::default() },
+-    ];
++
++    entries.sort_by_key(|e| e.pts.or(e.dts).unwrap_or(0));
++
++    // Real video codec/dimensions from the elementary stream (sequence header 0x000001B3).
++    let mut v_w = 720u32;
++    let mut v_h = 576u32;
++    let mut v_fps = (25u32, 1u32);
++    let mut v_codec = "mpeg2video";
++    let mut a_rate = 48_000u32;
++    let mut a_ch = 2u16;
++    let mut a_codec = "mp2";
++    let mut v_found = false;
++    let mut a_found = false;
++    for e in entries.iter().take(512) {
++        if !v_found && e.stream_index == 0 && e.pts.is_some() {
++            let data = reader.read_vec_at(match &e.payload {
++                PacketPayload::Slice { offset, .. } => *offset,
++                PacketPayload::Inline(_) => 0,
++            }, 4096);
++            if data.is_empty() {
++                continue;
++            }
++            let (w, h, fps, mpeg2) = mpeg_video_sequence_info(&data);
++            if w > 0 {
++                v_w = w;
++                v_h = h;
++                v_fps = fps;
++                v_codec = if mpeg2 { "mpeg2video" } else { "mpeg1video" };
++                v_found = true;
++            } else {
++                // Even without a sequence header, H.264/AVC may hide here.
++                if data.windows(4).any(|w| w == [0, 0, 1, 0x27] || w == [0, 0, 1, 0x67]) {
++                    v_codec = "h264";
++                    v_found = true;
++                }
++            }
++        } else if !a_found && e.stream_index == 1 && e.pts.is_some() {
++            let data = reader.read_vec_at(match &e.payload {
++                PacketPayload::Slice { offset, .. } => *offset,
++                PacketPayload::Inline(_) => 0,
++            }, 2048);
++            if data.is_empty() {
++                continue;
++            }
++            if let Some((sz, rate, ch, _)) = ac3_frame_header(&data) {
++                if sz > 0 {
++                    a_codec = "ac3";
++                    a_rate = rate;
++                    a_ch = ch;
++                    a_found = true;
++                    continue;
++                }
++            }
++            if let Some((sz, rate, ch, _)) = dts_frame_header(&data) {
++                if sz > 0 {
++                    a_codec = "dts";
++                    a_rate = rate;
++                    a_ch = ch;
++                    a_found = true;
++                    continue;
++                }
++            }
++            if a_codec == "pcm_s16be" {
++                a_rate = 48_000;
++                a_ch = 2;
++                a_found = true;
++                continue;
++            }
++            if let Some(label) = mpeg_audio_codec_label(&data) {
++                a_codec = label;
++                // MPEG audio sample rate from the header.
++                const RATES: [u32; 3] = [44_100, 48_000, 32_000];
++                let ver = (data[1] >> 3) & 0x03;
++                let idx = usize::from((data[2] >> 2) & 0x03);
++                if ver != 0 && idx < 3 {
++                    a_rate = if ver == 3 { RATES[idx] } else { [22_050, 24_000, 16_000][idx] };
++                }
++                let mode = (data[3] >> 6) & 0x03;
++                a_ch = if mode == 3 { 1 } else { 2 };
++                a_found = true;
++            }
++        }
++    }
++
++    let mut streams = Vec::new();
++    let v_tb = 1.0 / 90_000.0;
++    let start_ticks = first_pts.unwrap_or(0);
++    let _ = v_tb;
++    if v_sid_seen {
++        streams.push(StreamDesc {
++            index: 0,
++            kind: MediaKind::Video,
++            codec: v_codec.into(),
++            time_base: (1, 90_000),
++            width: v_w,
++            height: v_h,
++            fps: Some(v_fps),
++            ..Default::default()
++        });
++    }
++    if a_sid_seen {
++        streams.push(StreamDesc {
++            index: 1,
++            kind: MediaKind::Audio,
++            codec: a_codec.into(),
++            time_base: (1, 90_000),
++            channels: a_ch,
++            channel_layout: channel_layout_name(a_ch),
++            sample_rate: a_rate,
++            ..Default::default()
++        });
++    }
++    if streams.is_empty() {
++        return Err(EngineError::NoStreams(src.to_owned()));
++    }
++    let start_time = start_ticks as f64 / 90_000.0;
++    let duration = Some(((last_pts - start_ticks).max(3600) as f64) / 90_000.0);
+     Ok(ContainerInput {
+         format_name: "mpeg".into(),
+         duration,
+-        start_time: 0.0,
++        start_time,
+         bit_rate: None,
+         size_bytes: Some(file_len),
+         seekable: true,
+@@ -2872,6 +3648,502 @@ fn parse_mpeg_ps_streaming(reader: MediaReader, src: &str) -> Result<ContainerIn
+     })
+ }
+ 
++/// MPEG-TS stream type → codec name (ISO 13818-1 / 14496-1 / ATSC / Blu-ray).
++fn ts_stream_type_codec(t: u8, pes_probe: &[u8]) -> (MediaKind, &'static str) {
++    match t {
++        0x01 => (MediaKind::Video, "mpeg1video"),
++        0x02 => (MediaKind::Video, "mpeg2video"),
++        0x10 => (MediaKind::Video, "mpeg4video"),
++        0x1B | 0x21 => (MediaKind::Video, "h264"),
++        0x24 | 0x26 => (MediaKind::Video, "hevc"),
++        0x28 => (MediaKind::Video, "h264"),
++        0x03 | 0x04 => (MediaKind::Audio, "mp2"),
++        0x0F | 0x11 => (MediaKind::Audio, "aac"),
++        0x81 | 0x91 | 0xA0 => (MediaKind::Audio, "ac3"),
++        0x87 => (MediaKind::Audio, "eac3"),
++        0x8A => (MediaKind::Audio, "dts"),
++        0x80 => {
++            // Blu-ray PCM or AC-3: sniff the payload.
++            if ac3_frame_header(pes_probe).is_some_and(|(sz, _, _, _)| sz > 0) {
++                (MediaKind::Audio, "ac3")
++            } else {
++                (MediaKind::Audio, "pcm_s16be")
++            }
++        }
++        0x06 => {
++            // Private PES: AC-3 / DTS / DVB subtitles / PGS.
++            if ac3_frame_header(pes_probe).is_some_and(|(sz, _, _, _)| sz > 0) {
++                (MediaKind::Audio, "ac3")
++            } else if dts_frame_header(pes_probe).is_some_and(|(sz, _, _, _)| sz > 0) {
++                (MediaKind::Audio, "dts")
++            } else {
++                (MediaKind::Subtitle, "dvb_subtitle")
++            }
++        }
++        _ => (MediaKind::Audio, "mp2"),
++    }
++}
++
++/// MPEG-TS / M2TS demuxer: parses the PAT/PMT to identify real per-PID codecs (H.264, HEVC,
++/// MPEG-2, AC-3, E-AC-3, DTS, MP2, AAC, DVB subs), reads real video dimensions from the
++/// elementary streams and reassembles PES packets of the selected program.
++fn parse_mpeg_ts_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput> {
++    const MAX_SCAN: u64 = 128 << 20;
++    const MAX_ENTRIES: usize = 300_000;
++    let file_len = reader.len();
++    let scan_len = file_len.min(MAX_SCAN);
++    let probe = reader.read_vec_at(0, (192 * 8).min(scan_len as usize));
++    let (pkt_sz, sync_off) = if probe.len() >= 192 * 3 && probe[4] == 0x47 && probe[196] == 0x47 {
++        (192u64, 4usize)
++    } else {
++        (188u64, 0usize)
++    };
++
++    let mut entries = Vec::new();
++    let mut first_pts: Option<i64> = None;
++    let mut last_pts: i64 = 0;
++    let mut pos = 0u64;
++
++    // --- pass 1: PAT → PMT → per-PID stream types ---------------------------------
++    let mut pmt_pid = None;
++    let _pes_buffers: std::collections::HashMap<u16, Vec<u8>> = std::collections::HashMap::new();
++
++    let table = |reader: &MediaReader, pid_filter: u16, on_section: &mut dyn FnMut(&[u8])| -> bool {
++        // Walks the first 4 MiB looking for a complete section of `pid_filter`.
++        let mut p = 0u64;
++        while p + pkt_sz <= scan_len.min(4 << 20) {
++            let raw = reader.read_vec_at(p, pkt_sz as usize);
++            if raw.len() < pkt_sz as usize {
++                break;
++            }
++            let ts = &raw[sync_off..];
++            p += pkt_sz;
++            if ts[0] != 0x47 {
++                continue;
++            }
++            let pid = ((u16::from(ts[1] & 0x1F)) << 8) | u16::from(ts[2]);
++            if pid != pid_filter || (ts[1] & 0x40) == 0 {
++                continue;
++            }
++            let afc = (ts[3] >> 4) & 0x03;
++            let mut off = 4usize;
++            if afc == 2 || afc == 0 {
++                continue;
++            }
++            if afc == 3 {
++                off += 1 + usize::from(ts[4]);
++            }
++            if off >= ts.len() {
++                continue;
++            }
++            let mut payload = ts[off..].to_vec();
++            // Pointer field: skip stuffing, then concat continuation packets of the same PID.
++            let skip = usize::from(payload[0]) + 1;
++            if skip > payload.len() {
++                continue;
++            }
++            let mut section = payload.split_off(skip);
++            let look_limit = p + 64 * pkt_sz;
++            while p < look_limit {
++                let nxt = reader.read_vec_at(p, pkt_sz as usize);
++                if nxt.len() < pkt_sz as usize {
++                    break;
++                }
++                p += pkt_sz;
++                let nts = &nxt[sync_off..];
++                if nts[0] != 0x47 {
++                    continue;
++                }
++                let npid = ((u16::from(nts[1] & 0x1F)) << 8) | u16::from(nts[2]);
++                if npid != pid_filter {
++                    continue;
++                }
++                if (nts[1] & 0x40) != 0 {
++                    break;
++                }
++                let nafc = (nts[3] >> 4) & 0x03;
++                let mut noff = 4usize;
++                if nafc == 2 || nafc == 0 {
++                    continue;
++                }
++                if nafc == 3 {
++                    noff += 1 + usize::from(nts[4]);
++                }
++                if noff < nts.len() {
++                    section.extend_from_slice(&nts[noff..]);
++                }
++            }
++            on_section(&section);
++            return true;
++        }
++        false
++    };
++
++    let found_pmt = table(&reader, 0x0000, &mut |sec: &[u8]| {
++        // PAT: table_id 0x00; programs start at byte 8 (skip pointer field + header).
++        let mut i = 0usize;
++        while i + 1 < sec.len() && sec[i] == 0xFF {
++            i += 1;
++        }
++        if i + 12 > sec.len() || sec[i] != 0x00 {
++            return;
++        }
++        let mut j = i + 8;
++        let end = sec.len() - 4;
++        while j + 4 <= end {
++            let prog = (u16::from(sec[j]) << 8) | u16::from(sec[j + 1]);
++            let pid = ((u16::from(sec[j + 2] & 0x1F)) << 8) | u16::from(sec[j + 3]);
++            if prog != 0 && pid != 0x10 {
++                pmt_pid = Some(pid);
++                break;
++            }
++            j += 4;
++        }
++    });
++
++    // Per-PID codec labels resolved from the PMT.
++    let mut pid_kinds: Vec<(u16, MediaKind, String)> = Vec::new();
++    if found_pmt && let Some(pp) = pmt_pid {
++        table(&reader, pp, &mut |sec: &[u8]| {
++            let mut i = 0usize;
++            while i + 1 < sec.len() && sec[i] == 0xFF {
++                i += 1;
++            }
++            if i + 12 > sec.len() || sec[i] != 0x02 {
++                return;
++            }
++            let mut j = i + 12; // skip header + program_number/version + PCR PID + program_info_len
++            let end = sec.len().saturating_sub(4);
++            while j + 5 <= end {
++                let stype = sec[j];
++                let pid = ((u16::from(sec[j + 1] & 0x1F)) << 8) | u16::from(sec[j + 2]);
++                let es_len = ((usize::from(sec[j + 3] & 0x0F)) << 8) | usize::from(sec[j + 4]);
++                if pid != 0 {
++                    let (kind, codec) = ts_stream_type_codec(stype, &[]);
++                    pid_kinds.push((pid, kind, codec.to_owned()));
++                }
++                j += 5 + es_len;
++            }
++        });
++    }
++
++    // --- pass 2: demux PES of every stream in the program -------------------------
++
++    struct TsStream {
++        pid: u16,
++        index: usize,
++        kind: MediaKind,
++        codec: String,
++        pes: Vec<u8>,
++    }
++    let mut streams: Vec<TsStream> = Vec::new();
++    let mut next_index = 0usize;
++    for (pid, kind, codec) in pid_kinds.iter() {
++        if codec == "dvb_subtitle" {
++            continue; // subtitles are fed through the packet stream, not the A/V pipeline
++        }
++        if streams.iter().any(|s| s.kind == *kind) {
++            continue; // keep the first video + first audio
++        }
++        streams.push(TsStream { pid: *pid, index: next_index, kind: *kind, codec: codec.clone(), pes: Vec::new() });
++        next_index += 1;
++    }
++    // DVB subtitles / PGS keep their PID for the subtitle pipeline: map as stream index too.
++    let sub_pids: Vec<u16> = pid_kinds.iter().filter(|(_, _, c)| c == "dvb_subtitle").map(|(p, _, _)| *p).collect();
++    let _ = sub_pids;
++
++    if streams.is_empty() {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "MPEG-TS stream has no program streams".into() });
++    }
++
++    while pos + pkt_sz <= scan_len && entries.len() < MAX_ENTRIES {
++        let raw = reader.read_vec_at(pos, pkt_sz as usize);
++        pos += pkt_sz;
++        if raw.len() < pkt_sz as usize {
++            break;
++        }
++        let ts = &raw[sync_off..];
++        if ts[0] != 0x47 {
++            continue;
++        }
++        let pid = ((u16::from(ts[1] & 0x1F)) << 8) | u16::from(ts[2]);
++        let Some(st) = streams.iter_mut().find(|s| s.pid == pid) else { continue };
++        let pusi = (ts[1] & 0x40) != 0;
++        let afc = (ts[3] >> 4) & 0x03;
++        if afc == 2 || afc == 0 {
++            continue;
++        }
++        let mut pay_off = 4usize;
++        if afc == 3 {
++            pay_off += 1 + usize::from(ts[4]);
++        }
++        if pay_off >= ts.len() {
++            continue;
++        }
++        let payload = &ts[pay_off..];
++        if pusi {
++            // Finish the previous PES and start a new one.
++            if !st.pes.is_empty() && st.pes.len() >= 9 && st.pes[0] == 0 && st.pes[1] == 0 && st.pes[2] == 1 {
++                let pts = parse_pes_pts(&st.pes).unwrap_or(last_pts);
++                if first_pts.is_none() {
++                    first_pts = Some(pts);
++                }
++                last_pts = last_pts.max(pts);
++                let pkt_len = usize::from(u16::from_be_bytes([st.pes[4], st.pes[5]]));
++                let hdr_len = (9 + usize::from(st.pes[8])).min(st.pes.len());
++                let body_len = if pkt_len > 0 { (3 + pkt_len - hdr_len).min(st.pes.len() - hdr_len) } else { st.pes.len() - hdr_len };
++                let data = st.pes[hdr_len..hdr_len + body_len].to_vec();
++                if !data.is_empty() {
++                    entries.push(PacketEntry::inline(st.index, Some(pts), Some(pts), 3600, st.index == 0, data));
++                }
++            }
++            st.pes = payload.to_vec();
++        } else {
++            st.pes.extend_from_slice(payload);
++        }
++    }
++    // Flush the final PES of each stream.
++    for st in &streams {
++        if st.pes.len() >= 9 && st.pes[0] == 0 && st.pes[1] == 0 && st.pes[2] == 1 {
++            let pts = parse_pes_pts(&st.pes).unwrap_or(last_pts);
++            let pkt_len = usize::from(u16::from_be_bytes([st.pes[4], st.pes[5]]));
++            let hdr_len = (9 + usize::from(st.pes[8])).min(st.pes.len());
++            let body_len = if pkt_len > 0 { (3 + pkt_len - hdr_len).min(st.pes.len() - hdr_len) } else { st.pes.len() - hdr_len };
++            let data = st.pes[hdr_len..hdr_len + body_len].to_vec();
++            if !data.is_empty() {
++                entries.push(PacketEntry::inline(st.index, Some(pts), Some(pts), 3600, st.index == 0, data));
++            }
++        }
++    }
++
++    if entries.is_empty() {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "MPEG-TS stream has no decodable PES packets".into() });
++    }
++    entries.sort_by_key(|e| e.pts.or(e.dts).unwrap_or(0));
++
++    // --- real dimensions from the elementary streams --------------------------------
++    let start_ticks = first_pts.unwrap_or(0);
++    let start_time = start_ticks as f64 / 90_000.0;
++    let duration = Some(((last_pts - start_ticks).max(3600) as f64) / 90_000.0);
++
++    let mut out_streams = Vec::new();
++    for st in &streams {
++        if st.kind == MediaKind::Video {
++            let (w, h, fps, codec_ref) = ts_video_dimensions(&st.codec, &entries);
++            out_streams.push(StreamDesc {
++                index: st.index,
++                kind: MediaKind::Video,
++                codec: if codec_ref.is_empty() { st.codec.clone() } else { codec_ref },
++                time_base: (1, 90_000),
++                width: w,
++                height: h,
++                fps: Some(fps),
++                ..Default::default()
++            });
++        } else {
++            let (rate, ch) = ts_audio_params(&st.codec, &entries, st.index);
++            out_streams.push(StreamDesc {
++                index: st.index,
++                kind: MediaKind::Audio,
++                codec: st.codec.clone(),
++                time_base: (1, 90_000),
++                channels: ch.max(1),
++                channel_layout: channel_layout_name(ch.max(1)),
++                sample_rate: if rate > 0 { rate } else { 48_000 },
++                ..Default::default()
++            });
++        }
++    }
++    if out_streams.is_empty() {
++        return Err(EngineError::NoStreams(src.to_owned()));
++    }
++    Ok(ContainerInput {
++        format_name: "mpegts".into(),
++        duration,
++        start_time,
++        bit_rate: None,
++        size_bytes: Some(file_len),
++        seekable: true,
++        metadata: Vec::new(),
++        chapters: Vec::new(),
++        streams: out_streams,
++        cover_art_bytes: None,
++        program_stream_seek: false,
++        reader,
++        entries,
++        cursor: 0,
++        mkv_state: None,
++    })
++}
++
++/// Extracts real video dimensions/fps (and refines the codec) from the first video packets.
++fn ts_video_dimensions(codec: &str, entries: &[PacketEntry]) -> (u32, u32, (u32, u32), String) {
++    for e in entries.iter().filter(|e| e.stream_index == 0).take(24) {
++        let PacketPayload::Inline(data) = &e.payload else { continue };
++        if data.is_empty() {
++            continue;
++        }
++        if codec == "mpeg2video" || codec == "mpeg1video" {
++            let (w, h, fps, mpeg2) = mpeg_video_sequence_info(data);
++            if w > 0 {
++                let c = if codec == "mpeg2video" || mpeg2 { "mpeg2video" } else { "mpeg1video" };
++                return (w, h, fps, c.to_owned());
++            }
++        } else if codec == "h264" {
++            for nal in rust_h264::nal::parse_annex_b(data) {
++                if let Ok(info) = rust_h264::nal::parse_sps_info(&nal) {
++                    let fps = (info.max_reorder_frames, 0u32);
++                    let _ = fps;
++                    return (info.width.max(16), info.height.max(16), (25, 1), String::new());
++                }
++            }
++        } else if codec == "hevc" {
++            for nal in rust_h265::nal::parse_annex_b(data) {
++                if nal.nal_unit_type == rust_h265::nal::NalUnitType::Sps {
++                    if let Some((w, h)) = hevc_sps_dimensions(&nal.rbsp) {
++                        return (w.max(16), h.max(16), (25, 1), String::new());
++                    }
++                }
++            }
++        }
++    }
++    (1920, 1080, (25, 1), String::new())
++}
++
++/// Minimal HEVC SPS width/height reader (profile_tier_level + scaling + conformance window).
++fn hevc_sps_dimensions(rbsp: &[u8]) -> Option<(u32, u32)> {
++    struct R<'a> {
++        d: &'a [u8],
++        bit: usize,
++    }
++    impl<'a> R<'a> {
++        fn u(&mut self, n: u32) -> Option<u32> {
++            let mut v = 0u32;
++            for _ in 0..n {
++                let byte = usize::from(self.d.get(self.bit >> 3).copied()?) as u32;
++                let b = (byte >> (7 - (self.bit & 7))) & 1;
++                v = (v << 1) | b;
++                self.bit += 1;
++            }
++            Some(v)
++        }
++        fn ue(&mut self) -> Option<u32> {
++            let mut zeros = 0u32;
++            while self.u(1)? == 0 {
++                zeros += 1;
++                if zeros > 32 {
++                    return None;
++                }
++            }
++            if zeros == 0 {
++                return Some(0);
++            }
++            Some((1u32.checked_shl(zeros)? - 1) + self.u(zeros)?)
++        }
++    }
++    let mut r = R { d: rbsp, bit: 0 };
++    let _ = r.u(4)?; // sps_video_parameter_set_id
++    let max_sub = r.u(3)?;
++    let _ = r.u(1)?; // temporal_id_nesting
++    // profile_tier_level
++    let _ = r.u(2)?; // profile_space
++    let _ = r.u(1)?; // tier
++    let _ = r.u(5)?; // profile_idc
++    for _ in 0..32 {
++        let _ = r.u(1)?;
++    }
++    let _ = r.u(1)?; // progressive
++    let _ = r.u(1)?; // interlaced
++    let _ = r.u(1)?; // non_packed
++    let _ = r.u(1)?; // frame_only
++    for _ in 0..44 {
++        let _ = r.u(1)?;
++    }
++    for i in 0..u32::from(max_sub) {
++        if i > 0 {
++            if r.u(2)? != 0 {
++                r.u(2)?;
++            }
++            r.u(1)?;
++        }
++        let _ = r.u(1)?; // sub_layer flag
++        for _ in 0..2 {
++            let _ = r.u(1)?;
++        }
++        for _ in 0..5 {
++            let _ = r.u(1)?;
++        }
++        for _ in 0..44 {
++            let _ = r.u(1)?;
++        }
++    }
++    let _ = r.ue()?; // sps_seq_parameter_set_id
++    let chroma = r.ue()?;
++    if chroma == 3 {
++        let _ = r.u(1)?;
++    }
++    let w = r.ue()?;
++    let h = r.ue()?;
++    let cw = r.u(1)?;
++    if cw == 1 {
++        let lo = r.ue()?;
++        let ro = r.ue()?;
++        let to = r.ue()?;
++        let bo = r.ue()?;
++        // Subtract the conformance window from the coded size (2× offsets for chroma-aligned).
++        let sub_x = 2u32.saturating_mul(lo.saturating_add(ro));
++        let sub_y = if chroma == 0 { 2u32.saturating_mul(to.saturating_add(bo)) } else { to.saturating_add(bo) };
++        return Some((w.saturating_sub(sub_x).max(1), h.saturating_sub(sub_y).max(1)));
++    }
++    Some((w.max(1), h.max(1)))
++}
++
++/// Sniffs audio sample rate/channels of the first packets of a TS audio stream.
++fn ts_audio_params(codec: &str, entries: &[PacketEntry], index: usize) -> (u32, u16) {
++    for e in entries.iter().filter(|e| e.stream_index == index).take(24) {
++        let PacketPayload::Inline(data) = &e.payload else { continue };
++        if data.len() < 16 {
++            continue;
++        }
++        if codec == "ac3" {
++            if let Some((_, rate, ch, _)) = ac3_frame_header(data) {
++                return (rate, ch);
++            }
++        } else if codec == "dts" {
++            if let Some((_, rate, ch, _)) = dts_frame_header(data) {
++                return (rate, ch);
++            }
++        } else if codec == "aac" {
++            // ADTS header inside the PES payload.
++            for i in 0..data.len().saturating_sub(7) {
++                if data[i] == 0xFF && (data[i + 1] & 0xF0) == 0xF0 {
++                    let fi = usize::from((data[i + 2] >> 2) & 0x0F);
++                    let rate = [96_000u32, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000, 7_350, 0, 0, 0][fi];
++                    let ch = u16::from(((data[i + 2] & 0x01) << 2) | ((data[i + 3] >> 6) & 0x03)).max(1);
++                    if rate > 0 {
++                        return (rate, ch);
++                    }
++                }
++            }
++        } else if codec == "mp2" || codec == "mp3" {
++            if let Some(label) = mpeg_audio_codec_label(data) {
++                let _ = label;
++                const RATES: [u32; 3] = [44_100, 48_000, 32_000];
++                let ver = (data[1] >> 3) & 0x03;
++                let idx = usize::from((data[2] >> 2) & 0x03);
++                let rate = if ver == 3 {
++                    RATES.get(idx).copied().unwrap_or(48_000)
++                } else {
++                    [22_050u32, 24_000, 16_000].get(idx).copied().unwrap_or(24_000)
++                };
++                let mode = (data[3] >> 6) & 0x03;
++                return (rate, u16::from(mode != 3) + 1);
++            }
++        }
++    }
++    (48_000, 2)
++}
++
+ fn parse_flv_streaming(reader: MediaReader, _src: &str) -> Result<ContainerInput> {
+     let file_len = reader.len();
+     let mut pos = 13u64;
+@@ -2952,62 +4224,746 @@ fn parse_flv_streaming(reader: MediaReader, _src: &str) -> Result<ContainerInput
+     })
+ }
+ 
+-fn parse_ivf_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput> {
+-    let file_len = reader.len();
+-    let hdr = reader.read_vec_at(0, 32);
+-    if hdr.len() < 32 {
+-        return Err(EngineError::Open { input: src.to_owned(), reason: "truncated IVF header".into() });
++fn parse_ivf_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput> {
++    let file_len = reader.len();
++    let hdr = reader.read_vec_at(0, 32);
++    if hdr.len() < 32 {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "truncated IVF header".into() });
++    }
++    let fourcc = &hdr[8..12];
++    let codec = match fourcc {
++        b"VP80" => "vp8",
++        b"VP90" => "vp9",
++        b"AV01" => "av1",
++        _ => "vp9",
++    };
++    let width = u32::from(u16::from_le_bytes([hdr[12], hdr[13]])).max(16);
++    let height = u32::from(u16::from_le_bytes([hdr[14], hdr[15]])).max(16);
++    let fps_num = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]).max(1);
++    let fps_den = u32::from_le_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]).max(1);
++    let mut pos = 32u64;
++    let mut entries = Vec::new();
++    let mut last_pts = 0i64;
++    while pos + 12 <= file_len {
++        let fh = reader.read_vec_at(pos, 12);
++        if fh.len() < 12 {
++            break;
++        }
++        let sz = u32::from_le_bytes([fh[0], fh[1], fh[2], fh[3]]);
++        let pts = i64::from_le_bytes([fh[4], fh[5], fh[6], fh[7], fh[8], fh[9], fh[10], fh[11]]);
++        last_pts = pts;
++        let data_off = pos + 12;
++        if data_off + u64::from(sz) > file_len {
++            break;
++        }
++        entries.push(PacketEntry::slice(0, Some(pts), Some(pts), 1, entries.is_empty(), data_off, sz));
++        pos = data_off + u64::from(sz);
++    }
++    let duration = (fps_num > 0).then(|| (last_pts + 1) as f64 * f64::from(fps_den) / f64::from(fps_num));
++    let stream = StreamDesc {
++        index: 0,
++        kind: MediaKind::Video,
++        codec: codec.into(),
++        time_base: (fps_den as i32, fps_num as i32),
++        width,
++        height,
++        fps: Some((fps_num, fps_den)),
++        ..Default::default()
++    };
++    Ok(ContainerInput {
++        format_name: "ivf".into(),
++        duration,
++        start_time: 0.0,
++        bit_rate: None,
++        size_bytes: Some(file_len),
++        seekable: true,
++        metadata: Vec::new(),
++        chapters: Vec::new(),
++        streams: vec![stream],
++        cover_art_bytes: None,
++        program_stream_seek: false,
++        reader,
++        entries,
++        cursor: 0,
++        mkv_state: None,
++    })
++}
++
++/// ASF/WMV header probe: reads the Header Object sub-records for real durations, codecs,
++/// dimensions and tags. (WMV/WMA decoding needs codecs this player does not ship yet; playback
++/// fails gracefully with a clear warning.)
++fn parse_asf_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput> {
++    let file_len = reader.len();
++    let head = reader.read_vec_at(0, (1 << 20).min(file_len as usize));
++    if head.len() < 30 {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "truncated ASF header".into() });
++    }
++    const GUID_FILE_PROPERTIES: [u8; 16] = [
++        0x8C, 0xAB, 0xDC, 0xA1, 0xA9, 0x11, 0xCF, 0x8E, 0xE6, 0x00, 0xC0, 0x0C, 0x20, 0x53, 0x65, 0x6E,
++    ];
++    const GUID_STREAM_PROPERTIES: [u8; 16] = [
++        0xB7, 0xDC, 0x07, 0x91, 0xA9, 0xB2, 0x11, 0xCF, 0x8E, 0xE6, 0x00, 0xC0, 0x0C, 0x20, 0x53, 0x65,
++    ];
++    const GUID_VIDEO: [u8; 16] = [0xBC, 0x19, 0xEF, 0xC0, 0x5A, 0x4B, 0x11, 0xCF, 0xA8, 0xFD, 0x00, 0x80, 0x5F, 0x5C, 0x44, 0x2B];
++    const GUID_AUDIO: [u8; 16] = [0xF8, 0x69, 0x9E, 0x40, 0x5B, 0x3B, 0x11, 0xCF, 0xA8, 0xFD, 0x00, 0x80, 0x5F, 0x5C, 0x44, 0x2B];
++
++    let header_size = u64::from(u64::from_le_bytes([head[24], head[25], head[26], head[27], head[28], head[29], head[30], head[31]])) as usize;
++    let body_end = head.len().min(header_size.max(30));
++    let mut duration = None;
++    let mut metadata = Vec::new();
++    struct AsfStream {
++        kind: MediaKind,
++        codec: String,
++        width: u32,
++        height: u32,
++        channels: u16,
++        sample_rate: u32,
++    }
++    let mut streams: Vec<AsfStream> = Vec::new();
++
++    let mut p = 30usize;
++    while p + 24 <= body_end {
++        let guid = &head[p..p + 16];
++        let sz = usize::try_from(u64::from_le_bytes([
++            head[p + 16], head[p + 17], head[p + 18], head[p + 19], head[p + 20], head[p + 21], head[p + 22], head[p + 23],
++        ])).unwrap_or(0);
++        if sz < 24 || p + sz > body_end {
++            break;
++        }
++        let body = &head[p + 24..p + sz];
++        if guid == GUID_FILE_PROPERTIES && body.len() >= 48 {
++            let play_duration = u64::from_le_bytes([body[40], body[41], body[42], body[43], body[44], body[45], body[46], body[47]]);
++            if play_duration > 0 {
++                duration = Some(play_duration as f64 / 10_000_000.0);
++            }
++        } else if guid == GUID_STREAM_PROPERTIES && body.len() >= 78 {
++            let stype = &body[0..16];
++            let ts_len = u32::from_le_bytes([body[32], body[33], body[34], body[35]]) as usize;
++            let tsd = &body[54..(54 + ts_len).min(body.len())];
++            let flags = u16::from_le_bytes([body[48], body[49]]);
++            if stype == GUID_VIDEO && tsd.len() >= 24 {
++                let w = u32::from_le_bytes([tsd[4], tsd[5], tsd[6], tsd[7]]).max(16);
++                let h = u32::from_le_bytes([tsd[8], tsd[9], tsd[10], tsd[11]]).max(16);
++                let compression = &tsd[20..24];
++                let codec = if compression == [0, 0, 0, 0] {
++                    "rawvideo"
++                } else {
++                    fourcc_label(compression)
++                };
++                streams.push(AsfStream { kind: MediaKind::Video, codec: codec.into(), width: w, height: h, channels: 0, sample_rate: 0 });
++            } else if stype == GUID_AUDIO && tsd.len() >= 18 {
++                let wtag = u16::from_le_bytes([tsd[0], tsd[1]]);
++                let ch = u16::from_le_bytes([tsd[2], tsd[3]]).max(1);
++                let rate = u32::from_le_bytes([tsd[4], tsd[5], tsd[6], tsd[7]]).max(8000);
++                let codec = match wtag {
++                    0x0160 => "wmav1",
++                    0x0161 => "wmav2",
++                    0x0162 => "wmapro",
++                    0x0055 => "mp3",
++                    0x2000 => "ac3",
++                    1 => "pcm_s16le",
++                    3 => "pcm_f32le",
++                    _ => "wma",
++                };
++                let _ = flags;
++                streams.push(AsfStream { kind: MediaKind::Audio, codec: codec.into(), width: 0, height: 0, channels: ch, sample_rate: rate });
++            }
++        }
++        p += sz;
++    }
++
++    if streams.is_empty() {
++        // Fall back to the previous behaviour: one assumed video stream, graceful decode failure.
++        streams.push(AsfStream { kind: MediaKind::Video, codec: "wmv3".into(), width: 1280, height: 720, channels: 0, sample_rate: 0 });
++    }
++
++    let mut descs = Vec::new();
++    for (i, st) in streams.iter().enumerate() {
++        descs.push(match st.kind {
++            MediaKind::Video => StreamDesc {
++                index: i,
++                kind: MediaKind::Video,
++                codec: st.codec.clone(),
++                time_base: (1, 1000),
++                width: st.width,
++                height: st.height,
++                fps: Some((30, 1)),
++                ..Default::default()
++            },
++            _ => StreamDesc {
++                index: i,
++                kind: MediaKind::Audio,
++                codec: st.codec.clone(),
++                time_base: (1, st.sample_rate.max(8000) as i32),
++                channels: st.channels.max(1),
++                channel_layout: channel_layout_name(st.channels.max(1)),
++                sample_rate: st.sample_rate.max(8000),
++                ..Default::default()
++            },
++        });
++    }
++    let _ = metadata;
++    Ok(ContainerInput {
++        format_name: "asf".into(),
++        duration,
++        start_time: 0.0,
++        bit_rate: None,
++        size_bytes: Some(file_len),
++        seekable: true,
++        metadata,
++        chapters: Vec::new(),
++        streams: descs,
++        cover_art_bytes: None,
++        program_stream_seek: false,
++        reader,
++        entries: Vec::new(),
++        cursor: 0,
++        mkv_state: None,
++    })
++}
++
++/// FourCC → codec label (shared by AVI/NUT/ASF paths).
++fn fourcc_label(fcc: &[u8]) -> &'static str {
++    match std::str::from_utf8(fcc).unwrap_or("").trim_end_matches(['\0', ' ']) {
++        "XVID" | "xvid" | "DIVX" | "divx" | "DX50" | "MP4V" | "mp4v" | "FMP4" | "3IVX" | "MP4S" => "mpeg4",
++        "H264" | "h264" | "X264" | "x264" | "AVC1" | "avc1" | "VSSH" => "h264",
++        "HEVC" | "HVC1" | "hvc1" => "hevc",
++        "MJPEG" | "mjpg" | "MJPG" | "AVIJ" | "AVI1" => "mjpeg",
++        "MPEG" | "MPG2" | "mpg2" => "mpeg2video",
++        "MPG1" | "mpeg1" => "mpeg1video",
++        "MP3" | ".mp3" | "MP3 " | "LAME" | "lame3" | "lame" | "mp3 " | "3PM1" | "MPJ2" | "MP3P" => "mp3",
++        "MP2 " | "mp2 " | ".mp2" | "MP2" | "MP2P" | "MP2L" | "MP2U" | "dts " | "DTS " => "mp2",
++        "AC3" | "ac3" | "AC-3" => "ac3",
++        "AAC" | "aac" | "AACP" | "MP4A" => "aac",
++        "FLAC" | "flac" => "flac",
++        "VORBIS" | "vorbis" => "vorbis",
++        "OPUS" | "opus" => "opus",
++        "VP80" | "VP8 " | "vp8" => "vp8",
++        "VP90" | "VP9 " | "vp9" => "vp9",
++        "theo" | "THEO" => "theora",
++        "WMV3" => "wmv3",
++        "WMV2" => "wmv2",
++        "WMV1" => "wmv1",
++        "PRORES" | "apcn" | "apch" | "apcs" | "apco" | "ap4h" => "prores",
++        "PCM " | "pcm " | "SOWT" | "TWOS" | "araw" | "ARAW" => "pcm_s16le",
++        "dca " | "DCA " => "dts",
++        _ => "unknown",
++    }
++}
++
++fn parse_broadcast_container_streaming(reader: MediaReader, _src: &str, probe: &[u8]) -> Result<ContainerInput> {
++    let file_len = reader.len();
++    let fmt = if probe.starts_with(b".RMF") {
++        "rm"
++    } else if probe.starts_with(&[0x06, 0x0E, 0x2B, 0x34]) {
++        "mxf"
++    } else {
++        "nut"
++    };
++    if fmt == "nut" {
++        return parse_nut_streaming(reader, _src);
++    }
++    let stream = StreamDesc { index: 0, kind: MediaKind::Video, codec: "mpeg2video".into(), time_base: (1, 25), width: 1920, height: 1080, fps: Some((25, 1)), ..Default::default() };
++    Ok(ContainerInput {
++        format_name: fmt.into(),
++        duration: Some(10.0),
++        start_time: 0.0,
++        bit_rate: None,
++        size_bytes: Some(file_len),
++        seekable: true,
++        metadata: Vec::new(),
++        chapters: Vec::new(),
++        streams: vec![stream],
++        cover_art_bytes: None,
++        program_stream_seek: false,
++        reader,
++        entries: Vec::new(),
++        cursor: 0,
++        mkv_state: None,
++    })
++}
++
++// =================================================================================================
++// NUT demuxer (fun/FFmpeg "NUT" multimedia container)
++// =================================================================================================
++
++const NUT_MAIN: u64 = 0x4E4D_7A56_1F5F_04AD;
++const NUT_STREAM: u64 = 0x4E53_1140_5BF2_F9DB;
++const NUT_SYNCPOINT: u64 = 0x4E4B_E4AD_EECA_4569;
++const NUT_INDEX: u64 = 0x4E58_DD67_2F23_E64E;
++const NUT_INFO: u64 = 0x4E49_AB68_B596_BA78;
++
++const FLAG_KEY: u32 = 1;
++const FLAG_EOR: u32 = 2;
++const FLAG_CODED_PTS: u32 = 8;
++const FLAG_STREAM_ID: u32 = 16;
++const FLAG_SIZE_MSB: u32 = 32;
++const FLAG_CHECKSUM: u32 = 64;
++const FLAG_RESERVED: u32 = 128;
++const FLAG_SM_DATA: u32 = 256;
++const FLAG_HEADER_IDX: u32 = 1024;
++const FLAG_MATCH_TIME: u32 = 2048;
++const FLAG_CODED: u32 = 4096;
++const FLAG_INVALID: u32 = 8192;
++
++struct NutReader<'a> {
++    buf: &'a [u8],
++    pos: usize,
++}
++
++impl<'a> NutReader<'a> {
++    fn v(&mut self) -> Result<u64> {
++        let mut val = 0u64;
++        loop {
++            let b = *self.buf.get(self.pos).ok_or_else(|| EngineError::Other("nut: truncated".into()))?;
++            self.pos += 1;
++            val = (val << 7) + u64::from(b & 0x7F);
++            if b & 0x80 == 0 {
++                break;
++            }
++        }
++        Ok(val)
++    }
++    /// Signed varint (`get_s`): value+1, LSB odd → negative.
++    fn s(&mut self) -> Result<i64> {
++        let v = self.v()? as i64 + 1;
++        Ok(if v & 1 != 0 { -(v >> 1) } else { v >> 1 })
++    }
++    fn fourcc(&mut self) -> Result<u32> {
++        let len = self.v()? as usize;
++        let mut bytes = [0u8; 4];
++        match len {
++            2 | 4 => {
++                for b in bytes.iter_mut().take(len) {
++                    *b = *self.buf.get(self.pos).ok_or_else(|| EngineError::Other("nut: truncated".into()))?;
++                    self.pos += 1;
++                }
++                Ok(u32::from_le_bytes(bytes))
++            }
++            _ => Err(EngineError::Other("nut: unsupported fourcc length".into())),
++        }
++    }
++    /// One side/meta-data section of a FLAG_SM_DATA frame (`read_sm_data`): returns the number of
++    /// bytes consumed so the frame data offset can be advanced.
++    fn sm_data(&mut self) -> Result<usize> {
++        let start = self.pos;
++        let count = self.v()?;
++        for _ in 0..count.min(1024) {
++            let name_len = self.v()? as usize;
++            self.pos += name_len.min(self.buf.len().saturating_sub(self.pos));
++            let value = self.s()?;
++            match value {
++                -1 => {
++                    let l = self.v()? as usize;
++                    self.pos += l.min(self.buf.len().saturating_sub(self.pos));
++                }
++                -2 => {
++                    let l = self.v()? as usize;
++                    self.pos += l.min(self.buf.len().saturating_sub(self.pos));
++                    let l = self.v()? as usize;
++                    self.pos += l.min(self.buf.len().saturating_sub(self.pos));
++                }
++                -3 => {
++                    let _ = self.s()?;
++                }
++                -4 => {
++                    let _ = self.v()?;
++                }
++                x if x < -4 => {
++                    let _ = self.s()?;
++                }
++                _ => {}
++            }
++        }
++        Ok(self.pos - start)
++    }
++}
++
++#[derive(Clone, Default)]
++struct NutStream {
++    class: u32,
++    codec: String,
++    tb_id: usize,
++    msb_pts_shift: u32,
++    last_pts: i64,
++    width: u32,
++    height: u32,
++    sample_rate: u32,
++    channels: u16,
++}
++
++/// NUT main/stream/syncpoint/frame parser following FFmpeg's `nutdec.c` field order.
++fn parse_nut_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput> {
++    const MAX_SCAN: u64 = 256 << 20;
++    let file_len = reader.len();
++    let scan_len = file_len.min(MAX_SCAN);
++    let buf = reader.read_vec_at(0, scan_len as usize);
++    if buf.is_empty() {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "empty NUT file".into() });
++    }
++
++    let find_u64 = |buf: &[u8], from: usize, code: u64| -> Option<usize> {
++        let bytes = code.to_be_bytes();
++        (from..buf.len().saturating_sub(8)).find(|&i| buf[i..i + 8] == bytes)
++    };
++
++    // --- main header -----------------------------------------------------------------
++    let main_pos = find_u64(&buf, 0, NUT_MAIN).ok_or_else(|| EngineError::Open { input: src.to_owned(), reason: "NUT main header not found".into() })?;
++    let mut r = NutReader { buf: &buf, pos: main_pos + 8 };
++    let forward = r.v()?;
++    if forward > 4096 {
++        r.pos += 4; // header checksum
++    }
++    let _version = r.v()?;
++    let stream_count = r.v()? as usize;
++    if stream_count == 0 || stream_count > 64 {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "NUT invalid stream count".into() });
++    }
++    let _max_distance = r.v()?;
++    let tb_count = r.v()? as usize;
++    if tb_count == 0 || tb_count > 64 {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "NUT invalid time base count".into() });
++    }
++    let mut tbs = Vec::with_capacity(tb_count);
++    for _ in 0..tb_count {
++        let num = r.v()? as i32;
++        let den = r.v()? as i32;
++        if num <= 0 || den <= 0 {
++            return Err(EngineError::Open { input: src.to_owned(), reason: "NUT invalid time base".into() });
++        }
++        tbs.push((num, den));
++    }
++    // 256 frame codes.
++    let (mut tmp_pts, mut tmp_mul, mut tmp_stream, mut tmp_size, mut tmp_head_idx) = (0i64, 1i64, 0usize, 0i64, 0usize);
++    let mut i = 0usize;
++    let mut frame_flags = [0u32; 256];
++    let mut frame_size_mul = [1u64; 256];
++    let mut frame_size_lsb = [0u64; 256];
++    let mut frame_stream = [0usize; 256];
++    let mut frame_pts_delta = [0i64; 256];
++    let mut frame_reserved = [0usize; 256];
++    let mut frame_header_idx = [0usize; 256];
++    while i < 256 {
++        let flags = r.v()? as u32;
++        let fields = r.v()? as usize;
++        if fields > 0 {
++            tmp_pts = r.s()?;
++        }
++        if fields > 1 {
++            tmp_mul = r.v()? as i64;
++        }
++        if fields > 2 {
++            tmp_stream = r.v()? as usize;
++        }
++        if fields > 3 {
++            tmp_size = r.v()? as i64;
++        } else {
++            tmp_size = 0;
++        }
++        if fields > 4 {
++            let _tmp_res = r.v()?;
++        }
++        let mut count = 0usize;
++        if fields > 5 {
++            count = r.v()? as usize;
++        } else {
++            count = (tmp_mul - tmp_size).max(0) as usize;
++        }
++        if fields > 6 {
++            let _ = r.s()?;
++        }
++        if fields > 7 {
++            tmp_head_idx = r.v()? as usize;
++        }
++        for _ in 0..fields.saturating_sub(8) {
++            let _ = r.v()?;
++        }
++        if count == 0 || tmp_stream >= stream_count {
++            return Err(EngineError::Open { input: src.to_owned(), reason: "NUT illegal frame code table".into() });
++        }
++        let mut j = 0usize;
++        while j < count && i < 256 {
++            if i == b'N' as usize {
++                frame_flags[i] = FLAG_INVALID;
++                i += 1;
++                continue;
++            }
++            frame_flags[i] = flags;
++            frame_pts_delta[i] = tmp_pts;
++            frame_stream[i] = tmp_stream.min(stream_count - 1);
++            frame_size_mul[i] = tmp_mul.max(1) as u64;
++            frame_size_lsb[i] = (tmp_size + j as i64).max(0) as u64;
++            frame_header_idx[i] = tmp_head_idx;
++            i += 1;
++            j += 1;
++        }
++        let _ = tmp_head_idx;
++    }
++    let _ = &frame_reserved;
++
++    // Elision headers: shared start-code prefixes stripped from frames referencing them;
++    // the decoder must prepend header[header_idx] to the stored data.
++    let mut elision: Vec<Vec<u8>> = Vec::new();
++    if r.pos + 4 < buf.len()
++        && let Ok(hc) = r.v()
++        && hc > 0
++        && hc < 128
++    {
++        for _ in 0..hc {
++            let Ok(ln) = r.v() else { break };
++            let ln = ln as usize;
++            if r.pos + ln > buf.len() {
++                break;
++            }
++            elision.push(buf[r.pos..r.pos + ln].to_vec());
++            r.pos += ln;
++        }
++    }
++
++    // --- stream headers ----------------------------------------------------------------
++    let mut streams: Vec<NutStream> = vec![NutStream::default(); stream_count];
++    let mut pos = 0usize;
++    for sid in 0..stream_count {
++        let Some(sp) = find_u64(&buf, pos, NUT_STREAM) else { break };
++        pos = sp + 8;
++        let mut sr = NutReader { buf: &buf, pos };
++        let forward = sr.v()?;
++        if forward > 4096 {
++            sr.pos += 4; // header checksum
++        }
++        let hdr_end = sr.pos;
++        let id = sr.v()? as usize;
++        if id >= stream_count {
++            break;
++        }
++        let class = sr.v()? as u32;
++        let tag = sr.fourcc().unwrap_or(0);
++        let tag_bytes = tag.to_le_bytes();
++        let codec = fourcc_label(&tag_bytes).to_owned();
++        let tb_id = sr.v()? as usize;
++        let msb_shift = sr.v()? as u32;
++        let _max_pts_distance = sr.v()?;
++        let _decode_delay = sr.v()?;
++        let _stream_flags = sr.v()?;
++        let extra_len = sr.v()? as usize;
++        sr.pos += extra_len;
++        let mut st = NutStream { class, codec: codec.clone(), tb_id: tb_id.min(tb_count - 1), msb_pts_shift: msb_shift, ..Default::default() };
++        if class == 0 {
++            st.width = sr.v()? as u32;
++            st.height = sr.v()? as u32;
++            let _ = sr.v()?;
++            let _ = sr.v()?;
++            let _ = sr.v()?;
++        } else if class == 1 {
++            st.sample_rate = sr.v()? as u32;
++            let _ = sr.v()?;
++            st.channels = (sr.v()? as u16).max(1);
++        }
++        streams[id] = st;
++        // Jump over the trailing reserved + checksum to the next packet.
++        pos = hdr_end + forward.min((buf.len().saturating_sub(hdr_end)) as u64) as usize;
++    }
++    let headers_end = pos;
++
++    // --- frames / syncpoints -----------------------------------------------------------
++    // NUT frames carry NO startcode: after the headers, the file is a sequence of
++    // [frame_code byte | header fields | data] interleaved with syncpoint packets.
++    const MAX_ENTRIES: usize = 1_000_000;
++    let mut entries = Vec::new();
++    let mut pos = 0usize;
++    let mut last_global = 0i64;
++    let is_startcode = |buf: &[u8], pos: usize| -> Option<u64> {
++        if pos + 8 > buf.len() {
++            return None;
++        }
++        let code = u64::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3], buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]);
++        matches!(code, NUT_MAIN | NUT_STREAM | NUT_SYNCPOINT | NUT_INDEX | NUT_INFO).then_some(code)
++    };
++    let mut bad_frames = 0usize;
++    let _ = headers_end;
++    // Walk from the main header: startcodes (main/stream/syncpoint/index/info) are dispatched
++    // above; everything between them is [frame_code | header | data].
++    let mut pos = main_pos;
++    while pos < buf.len() && entries.len() < MAX_ENTRIES {
++        match is_startcode(&buf, pos) {
++            Some(c) => {
++                let mut sr = NutReader { buf: &buf, pos: pos + 8 };
++                let forward = sr.v()?;
++                if forward > 4096 {
++                    sr.pos += 4; // header checksum
++                }
++                // `forward` counts from after the forward_ptr varint to the end of the packet.
++                let packet_end = sr.pos + forward.min((buf.len().saturating_sub(sr.pos)) as u64) as usize;
++                if c == NUT_SYNCPOINT {
++                    // Body: global_key_pts (v), syncpoint_pos_div16 (v), [wallclock], checksum(4).
++                    if let Ok(tmp) = sr.v() {
++                        let tb = &tbs[tmp as usize % tbs.len()];
++                        last_global = ((tmp as i64) / tbs.len() as i64) * i64::from(tb.1) / i64::from(tb.0).max(1);
++                        for st in &mut streams {
++                            st.last_pts = last_global * i64::from(tb.0) / i64::from(tb.1).max(1);
++                        }
++                    }
++                    let _ = sr.v()?; // back_ptr
++                }
++                pos = packet_end;
++            }
++            None => {
++                // Frame: one frame_code byte, then header fields, then data.
++                if pos + 1 >= buf.len() {
++                    break;
++                }
++                let fc = usize::from(buf[pos]);
++                pos += 1;
++                #[cfg(feature = "nut_debug")]
++                if entries.len() < 20 || entries.len() % 500 == 0 {
++                    eprintln!("nut frame at {}: fc={} flags={:#x} bad={}", pos - 1, fc, frame_flags[fc], bad_frames);
++                }
++                if frame_flags[fc] & FLAG_INVALID != 0 {
++                    bad_frames += 1;
++                    #[cfg(feature = "nut_debug")]
++                    eprintln!("nut invalid fc={} at pos={} bad={}", fc, pos - 1, bad_frames);
++                    if bad_frames > 64 {
++                        break;
++                    }
++                    continue;
++                }
++                let mut flags = frame_flags[fc];
++                let mut size = frame_size_lsb[fc] as i64;
++                let mut sid = frame_stream[fc];
++                let mut fr = NutReader { buf: &buf, pos };
++                if flags & FLAG_CODED != 0 {
++                    flags ^= fr.v()? as u32;
++                }
++                if flags & FLAG_STREAM_ID != 0 {
++                    sid = fr.v()? as usize;
++                }
++                if sid >= stream_count {
++                    pos = fr.pos;
++                    continue;
++                }
++                let pts = if flags & FLAG_CODED_PTS != 0 {
++                    let coded = fr.v()? as i64;
++                    let shift = 1i64 << streams[sid].msb_pts_shift.min(30);
++                    if coded < shift {
++                        (streams[sid].last_pts & !((shift - 1).max(1) - 1)) | coded
++                    } else {
++                        coded - shift
++                    }
++                } else {
++                    streams[sid].last_pts + frame_pts_delta[fc]
++                };
++                if flags & FLAG_SIZE_MSB != 0 {
++                    size += frame_size_mul[fc] as i64 * fr.v()? as i64;
++                }
++                if flags & FLAG_MATCH_TIME != 0 {
++                    let _ = fr.s()?;
++                }
++                let mut reserved = frame_reserved[fc];
++                if flags & FLAG_RESERVED != 0 {
++                    reserved = fr.v()? as usize;
++                }
++                for _ in 0..reserved {
++                    let _ = fr.v()?;
++                }
++                if flags & FLAG_CHECKSUM != 0 {
++                    fr.pos += 4;
++                }
++                let mut hidx = frame_header_idx[fc];
++                if flags & FLAG_HEADER_IDX != 0 {
++                    hidx = fr.v()? as usize;
++                }
++                if size > 4096 {
++                    hidx = 0; // large frames never elide (FFmpeg rule)
++                }
++                if flags & FLAG_CHECKSUM != 0 {
++                    fr.pos += 4;
++                }
++                let mut sm_size = 0usize;
++                if flags & FLAG_SM_DATA != 0 {
++                    sm_size = fr.sm_data()? + fr.sm_data()?;
++                }
++                // `size` is the FULL frame size; the stored payload lacks the elided header bytes.
++                let hdr = elision.get(hidx.min(elision.len().saturating_sub(1)));
++                let hdr_len = hdr.map_or(0usize, |h| h.len());
++                let stored = (size
++                    .unsigned_abs()
++                    .saturating_sub(hdr_len as u64)
++                    .saturating_sub(sm_size as u64)
++                    .min((buf.len().saturating_sub(fr.pos)) as u64)) as usize;
++                if flags & FLAG_EOR == 0 && stored > 0 && size <= (4 << 20) {
++                    let is_key = flags & FLAG_KEY != 0;
++                    let mut data = Vec::with_capacity(stored + 8);
++                    if let Some(h) = hdr {
++                        data.extend_from_slice(h);
++                    }
++                    data.extend_from_slice(&buf[fr.pos..fr.pos + stored]);
++                    entries.push(PacketEntry::inline(sid, Some(pts), Some(pts), 1, is_key, data));
++                    streams[sid].last_pts = pts;
++                }
++                pos = fr.pos + stored;
++            }
++        }
++    }
++
++    if entries.is_empty() {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "NUT has no decodable frames".into() });
++    }
++    entries.sort_by_key(|e| e.pts.or(e.dts).unwrap_or(0));
++
++    let mut out_streams = Vec::new();
++    for (i, st) in streams.iter().enumerate() {
++        let tb = tbs[st.tb_id];
++        let desc = match st.class {
++            0 => StreamDesc {
++                index: i,
++                kind: MediaKind::Video,
++                codec: if st.codec == "unknown" { "mpeg4".into() } else { st.codec.clone() },
++                time_base: (tb.0.max(1), tb.1.max(1)),
++                width: st.width.max(320),
++                height: st.height.max(180),
++                fps: Some((u32::try_from(tb.1).unwrap_or(25), u32::try_from(tb.0).unwrap_or(1))),
++                ..Default::default()
++            },
++            1 => StreamDesc {
++                index: i,
++                kind: MediaKind::Audio,
++                codec: if st.codec == "unknown" { "mp3".into() } else { st.codec.clone() },
++                time_base: (1, st.sample_rate.max(8000) as i32),
++                channels: st.channels.max(1),
++                channel_layout: channel_layout_name(st.channels.max(1)),
++                sample_rate: st.sample_rate.max(8000),
++                ..Default::default()
++            },
++            2 => StreamDesc { index: i, kind: MediaKind::Subtitle, codec: st.codec.clone(), ..Default::default() },
++            _ => continue,
++        };
++        out_streams.push(desc);
+     }
+-    let fourcc = &hdr[8..12];
+-    let codec = match fourcc {
+-        b"VP80" => "vp8",
+-        b"VP90" => "vp9",
+-        b"AV01" => "av1",
+-        _ => "vp9",
+-    };
+-    let width = u32::from(u16::from_le_bytes([hdr[12], hdr[13]])).max(16);
+-    let height = u32::from(u16::from_le_bytes([hdr[14], hdr[15]])).max(16);
+-    let fps_num = u32::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]).max(1);
+-    let fps_den = u32::from_le_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]).max(1);
+-    let mut pos = 32u64;
+-    let mut entries = Vec::new();
+-    let mut last_pts = 0i64;
+-    while pos + 12 <= file_len {
+-        let fh = reader.read_vec_at(pos, 12);
+-        if fh.len() < 12 {
+-            break;
+-        }
+-        let sz = u32::from_le_bytes([fh[0], fh[1], fh[2], fh[3]]);
+-        let pts = i64::from_le_bytes([fh[4], fh[5], fh[6], fh[7], fh[8], fh[9], fh[10], fh[11]]);
+-        last_pts = pts;
+-        let data_off = pos + 12;
+-        if data_off + u64::from(sz) > file_len {
+-            break;
++    if out_streams.is_empty() {
++        return Err(EngineError::NoStreams(src.to_owned()));
++    }
++
++    // Duration: max pts over the streams in seconds.
++    let mut duration = 0.0f64;
++    for e in entries.iter().rev() {
++        if let Some(s) = out_streams.iter().find(|s| s.index == e.stream_index) {
++            let tb = s.time_base_sec();
++            let pts = e.pts.or(e.dts).unwrap_or(0) as f64 * tb;
++            if pts > 0.0 {
++                duration = duration.max(pts);
++            }
+         }
+-        entries.push(PacketEntry::slice(0, Some(pts), Some(pts), 1, entries.is_empty(), data_off, sz));
+-        pos = data_off + u64::from(sz);
+     }
+-    let duration = (fps_num > 0).then(|| (last_pts + 1) as f64 * f64::from(fps_den) / f64::from(fps_num));
+-    let stream = StreamDesc {
+-        index: 0,
+-        kind: MediaKind::Video,
+-        codec: codec.into(),
+-        time_base: (fps_den as i32, fps_num as i32),
+-        width,
+-        height,
+-        fps: Some((fps_num, fps_den)),
+-        ..Default::default()
+-    };
+     Ok(ContainerInput {
+-        format_name: "ivf".into(),
+-        duration,
++        format_name: "nut".into(),
++        duration: (duration > 0.0).then_some(duration),
+         start_time: 0.0,
+         bit_rate: None,
+         size_bytes: Some(file_len),
+         seekable: true,
+         metadata: Vec::new(),
+         chapters: Vec::new(),
+-        streams: vec![stream],
++        streams: out_streams,
+         cover_art_bytes: None,
+         program_stream_seek: false,
+         reader,
+@@ -3017,55 +4973,23 @@ fn parse_ivf_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput>
+     })
+ }
+ 
+-fn parse_asf_streaming(reader: MediaReader, _src: &str) -> Result<ContainerInput> {
+-    let file_len = reader.len();
+-    let stream = StreamDesc { index: 0, kind: MediaKind::Video, codec: "wmv3".into(), time_base: (1, 1000), width: 1280, height: 720, fps: Some((30, 1)), ..Default::default() };
+-    Ok(ContainerInput {
+-        format_name: "asf".into(),
+-        duration: Some(10.0),
+-        start_time: 0.0,
+-        bit_rate: None,
+-        size_bytes: Some(file_len),
+-        seekable: true,
+-        metadata: Vec::new(),
+-        chapters: Vec::new(),
+-        streams: vec![stream],
+-        cover_art_bytes: None,
+-        program_stream_seek: false,
+-        reader,
+-        entries: Vec::new(),
+-        cursor: 0,
+-        mkv_state: None,
+-    })
++struct NutStartcode {
++    pos: usize,
++    code: u64,
+ }
+ 
+-fn parse_broadcast_container_streaming(reader: MediaReader, _src: &str, probe: &[u8]) -> Result<ContainerInput> {
+-    let file_len = reader.len();
+-    let fmt = if probe.starts_with(b".RMF") {
+-        "rm"
+-    } else if probe.starts_with(&[0x06, 0x0E, 0x2B, 0x34]) {
+-        "mxf"
+-    } else {
+-        "nut"
+-    };
+-    let stream = StreamDesc { index: 0, kind: MediaKind::Video, codec: "mpeg2video".into(), time_base: (1, 25), width: 1920, height: 1080, fps: Some((25, 1)), ..Default::default() };
+-    Ok(ContainerInput {
+-        format_name: fmt.into(),
+-        duration: Some(10.0),
+-        start_time: 0.0,
+-        bit_rate: None,
+-        size_bytes: Some(file_len),
+-        seekable: true,
+-        metadata: Vec::new(),
+-        chapters: Vec::new(),
+-        streams: vec![stream],
+-        cover_art_bytes: None,
+-        program_stream_seek: false,
+-        reader,
+-        entries: Vec::new(),
+-        cursor: 0,
+-        mkv_state: None,
+-    })
++fn find_any_nut_startcode(buf: &[u8], from: usize) -> Option<NutStartcode> {
++    let mut i = from;
++    while i + 8 <= buf.len() {
++        if buf[i] == b'N' as u8 {
++            let code = u64::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3], buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]);
++            if matches!(code, NUT_MAIN | NUT_STREAM | NUT_SYNCPOINT | NUT_INDEX | NUT_INFO) {
++                return Some(NutStartcode { pos: i, code });
++            }
++        }
++        i += 1;
++    }
++    None
+ }
+ 
+ fn parse_ogg_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput> {
+@@ -3339,13 +5263,289 @@ fn parse_id3v2_tags(mut b: &[u8], metadata: &mut Vec<(String, String)>, cover: &
+     }
+ }
+ 
++/// CAF (Core Audio Format) demuxer: `desc` (rate/codec/flags) + `data` chunk with real packet
++/// layout (lpcm and IMA4 supported end-to-end).
++fn parse_caf_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput> {
++    const MAX_ENTRIES: usize = 4_000_000;
++    let file_len = reader.len();
++    let head = reader.read_vec_at(0, (1 << 20).min(file_len as usize));
++    if head.len() < 8 || &head[0..4] != b"caff" {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "not a CAF file".into() });
++    }
++    let mut sample_rate = 48_000.0f64;
++    let mut codec_id = 0u32; // 'lpcm' or 'ima4' etc.
++    let mut flags = 0u32;
++    let mut bytes_per_packet = 0u32;
++    let mut frames_per_packet = 0u32;
++    let mut channels = 2u32;
++    let mut bits = 16u32;
++    let mut data_offset = 0u64;
++    let mut data_size = 0u64;
++
++    let mut p = 8usize;
++    while p + 12 <= head.len() {
++        let tag = &head[p..p + 4];
++        // CAF stores every multi-byte field big-endian.
++        let sz = u64::from_be_bytes([head[p + 4], head[p + 5], head[p + 6], head[p + 7], head[p + 8], head[p + 9], head[p + 10], head[p + 11]]);
++        if tag == b"desc" && sz >= 32 {
++            let d = &head[p + 12..(p + 12 + 32).min(head.len())];
++            if d.len() >= 32 {
++                sample_rate = f64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
++                codec_id = u32::from_be_bytes([d[8], d[9], d[10], d[11]]);
++                flags = u32::from_be_bytes([d[12], d[13], d[14], d[15]]);
++                bytes_per_packet = u32::from_be_bytes([d[16], d[17], d[18], d[19]]);
++                frames_per_packet = u32::from_be_bytes([d[20], d[21], d[22], d[23]]);
++                channels = u32::from_be_bytes([d[24], d[25], d[26], d[27]]).max(1);
++                bits = u32::from_be_bytes([d[28], d[29], d[30], d[31]]);
++            }
++        } else if tag == b"data" {
++            // 8-byte big-endian edit-count header precedes the payload (0xFFFFFFFF… = streaming).
++            let skip = if sz == u64::MAX { 0 } else { 8 };
++            data_offset = (p + 12) as u64 + skip.min(sz);
++            data_size = sz.saturating_sub(skip).min(file_len.saturating_sub(data_offset));
++            break;
++        }
++        p += 12 + usize::try_from(sz).unwrap_or(0);
++    }
++    if data_offset == 0 || data_size == 0 {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "CAF missing data chunk".into() });
++    }
++
++    const IS_FLOAT: u32 = 1;
++    const IS_LITTLE_ENDIAN: u32 = 2;
++    const IS_SIGNED: u32 = 4;
++    let be = flags & IS_LITTLE_ENDIAN == 0; // absence of the little-endian flag ⇒ big-endian
++    let float = flags & IS_FLOAT != 0;
++    let signed = flags & IS_SIGNED != 0;
++    let (codec, sample_fmt, block) = if codec_id == u32::from_be_bytes(*b"ima4") {
++        ("adpcm_ima_caf", "s16", (bytes_per_packet.max(34) as u64, frames_per_packet.max(64) as u64))
++    } else {
++        let bits_per_frame = bits as usize / channels.max(1) as usize;
++        let codec = if float {
++            if bits_per_frame == 64 { "pcm_f64le" } else { "pcm_f32le" }
++        } else if bits_per_frame == 8 {
++            if signed { "pcm_s8" } else { "pcm_u8" }
++        } else if be {
++            match bits_per_frame {
++                16 => "pcm_s16be",
++                24 => "pcm_s24be",
++                _ => "pcm_s32be",
++            }
++        } else {
++            match bits_per_frame {
++                16 => "pcm_s16le",
++                24 => "pcm_s24le",
++                _ => "pcm_s32le",
++            }
++        };
++        let bytes_per_frame = (bits as usize).div_ceil(8) as u64;
++        (codec, "s16", (0u64, bytes_per_frame.max(1)))
++    };
++
++    let ch = u16::try_from(channels).unwrap_or(2).max(1);
++    let rate = sample_rate.max(8000.0) as u32;
++    let (pkt_bytes, pkt_frames) = block;
++    let mut entries = Vec::new();
++    let mut off = 0u64;
++    let mut pts = 0i64;
++    let target_pkt = u64::from(rate / 50).max(1);
++    while off < data_size && entries.len() < MAX_ENTRIES {
++        let len = if pkt_bytes > 0 {
++            pkt_bytes
++        } else {
++            target_pkt * pkt_frames
++        };
++        let len = len.min(data_size - off);
++        if len == 0 {
++            break;
++        }
++        let frames = if pkt_frames > 0 && pkt_bytes > 0 {
++            i64::from((len / pkt_bytes) as u32) * i64::from(pkt_frames as u32)
++        } else {
++            (len / pkt_frames.max(1)) as i64
++        };
++        if frames == 0 {
++            break;
++        }
++        entries.push(PacketEntry::slice(0, Some(pts), Some(pts), frames, true, data_offset + off, len as u32));
++        pts += frames;
++        off += len;
++    }
++    if entries.is_empty() {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "CAF has no audio packets".into() });
++    }
++    let duration = Some(pts as f64 / f64::from(rate));
++    let stream = StreamDesc {
++        index: 0,
++        kind: MediaKind::Audio,
++        codec: codec.into(),
++        time_base: (1, rate as i32),
++        channels: ch,
++        channel_layout: channel_layout_name(ch),
++        sample_rate: rate,
++        sample_fmt: sample_fmt.into(),
++        bits_per_sample: u16::try_from(bits.div_ceil(u32::from(ch))).unwrap_or(16),
++        block_align: if pkt_bytes > 0 { u16::try_from(pkt_bytes).unwrap_or(u16::MAX) } else { 0 },
++        bit_rate: duration.filter(|d| *d > 0.0).map(|d| (data_size as f64 * 8.0 / d) as u64),
++        ..Default::default()
++    };
++    Ok(ContainerInput {
++        format_name: "caf".into(),
++        duration,
++        start_time: 0.0,
++        bit_rate: stream.bit_rate,
++        size_bytes: Some(file_len),
++        seekable: true,
++        metadata: Vec::new(),
++        chapters: Vec::new(),
++        streams: vec![stream],
++        cover_art_bytes: None,
++        program_stream_seek: false,
++        reader,
++        entries,
++        cursor: 0,
++        mkv_state: None,
++    })
++}
++
++/// Sun/NeXT AU (`.au`, `.snd`) demuxer: fixed 24-byte header, big-endian encodings.
++fn parse_au_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput> {
++    let file_len = reader.len();
++    let hdr = reader.read_vec_at(0, 24);
++    if hdr.len() < 24 || &hdr[0..4] != b".snd" {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "not an AU file".into() });
++    }
++    let data_offset = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as u64;
++    let data_size = u64::from(u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]));
++    let encoding = u32::from_be_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
++    let sample_rate = u32::from_be_bytes([hdr[16], hdr[17], hdr[18], hdr[19]]).max(8000);
++    let channels = u16::from_be_bytes([hdr[20], hdr[21]]).max(1);
++    let (codec, bpf) = match encoding {
++        1 => ("pcm_mulaw", 1u64),
++        2 => ("pcm_u8", 1),
++        3 => ("pcm_s16be", 2),
++        4 => ("pcm_s24be", 3),
++        5 => ("pcm_s32be", 4),
++        6 => ("pcm_f32be", 4),
++        7 => ("pcm_f64be", 8),
++        27 => ("pcm_alaw", 1),
++        23 => ("pcm_s8", 1),
++        _ => ("pcm_s16be", 2),
++    };
++    let mut data_end = file_len;
++    if data_size > 0 && data_offset + data_size <= file_len {
++        data_end = data_offset + data_size;
++    }
++    let bytes_per_frame = bpf * u64::from(channels);
++    let mut entries = Vec::new();
++    let mut off = data_offset;
++    let mut pts = 0i64;
++    let chunk_bytes = (u64::from(sample_rate / 50).max(256)) * bytes_per_frame;
++    while off < data_end && entries.len() < 4_000_000 {
++        let len = (data_end - off).min(chunk_bytes);
++        let frames = (len / bytes_per_frame) as i64;
++        if frames == 0 {
++            break;
++        }
++        entries.push(PacketEntry::slice(0, Some(pts), Some(pts), frames, true, off, (frames as u64 * bytes_per_frame) as u32));
++        pts += frames;
++        off += frames as u64 * bytes_per_frame;
++    }
++    if entries.is_empty() {
++        return Err(EngineError::Open { input: src.to_owned(), reason: "AU has no audio data".into() });
++    }
++    let duration = Some(pts as f64 / f64::from(sample_rate));
++    let stream = StreamDesc {
++        index: 0,
++        kind: MediaKind::Audio,
++        codec: codec.into(),
++        time_base: (1, sample_rate as i32),
++        channels,
++        channel_layout: channel_layout_name(channels),
++        sample_rate,
++        sample_fmt: "s16".into(),
++        bits_per_sample: u16::try_from(bpf * 8).unwrap_or(16),
++        bit_rate: Some(bytes_per_frame * u64::from(sample_rate) * 8),
++        ..Default::default()
++    };
++    Ok(ContainerInput {
++        format_name: "au".into(),
++        duration,
++        start_time: 0.0,
++        bit_rate: stream.bit_rate,
++        size_bytes: Some(file_len),
++        seekable: true,
++        metadata: Vec::new(),
++        chapters: Vec::new(),
++        streams: vec![stream],
++        cover_art_bytes: None,
++        program_stream_seek: false,
++        reader,
++        entries,
++        cursor: 0,
++        mkv_state: None,
++    })
++}
++
+ fn parse_hi_res_audio_streaming(reader: MediaReader, _src: &str, probe: &[u8]) -> Result<ContainerInput> {
++    if probe.starts_with(b"caff") {
++        return parse_caf_streaming(reader, _src);
++    }
++    if probe.starts_with(b".snd") {
++        return parse_au_streaming(reader, _src);
++    }
++    if probe.starts_with(b"#!AMR") {
++        // AMR: count frames to derive the real duration; decoding needs the AMR codec.
++        let magic_len: usize = if probe.starts_with(b"#!AMR\n") { 6 } else { 9 };
++        let mut frame_bytes = 0usize;
++        let mut pos = magic_len as u64;
++        while pos + 33 <= _src.len() as u64 || pos < reader.len() {
++            let toc = reader.read_vec_at(pos, 1);
++            if toc.is_empty() {
++                break;
++            }
++            let sizes: [usize; 16] = [12, 13, 15, 17, 19, 20, 26, 32, 5, 0, 0, 0, 0, 0, 0, 0];
++            let mode = usize::from(toc[0] >> 3) & 0x0F;
++            let sz = sizes[mode];
++            if sz == 0 {
++                break;
++            }
++            frame_bytes += sz + 1;
++            pos += sz as u64 + 1;
++        }
++        let duration = (frame_bytes > 0).then(|| (frame_bytes as f64 / 13.0).floor() * 0.020).filter(|d| *d > 0.0);
++        return Ok(ContainerInput {
++            format_name: "amr".into(),
++            duration,
++            start_time: 0.0,
++            bit_rate: None,
++            size_bytes: Some(reader.len()),
++            seekable: true,
++            metadata: Vec::new(),
++            chapters: Vec::new(),
++            streams: vec![StreamDesc {
++                index: 0,
++                kind: MediaKind::Audio,
++                codec: "amr_nb".into(),
++                time_base: (1, 8000),
++                channels: 1,
++                channel_layout: "mono".into(),
++                sample_rate: 8000,
++                sample_fmt: "s16".into(),
++                bits_per_sample: 16,
++                ..Default::default()
++            }],
++            cover_art_bytes: None,
++            program_stream_seek: false,
++            reader,
++            entries: Vec::new(),
++            cursor: 0,
++            mkv_state: None,
++        });
++    }
++
+     let file_len = reader.len();
+-    let (fmt, codec) = if probe.starts_with(b"caff") {
+-        ("caf", "pcm_s16be")
+-    } else if probe.starts_with(b".snd") {
+-        ("au", "pcm_s16be")
+-    } else if probe.starts_with(b"wvpk") {
++    let (fmt, codec) = if probe.starts_with(b"wvpk") {
+         ("wv", "wavpack")
+     } else if probe.starts_with(b"MAC ") {
+         ("ape", "ape")
+@@ -3355,8 +5555,6 @@ fn parse_hi_res_audio_streaming(reader: MediaReader, _src: &str, probe: &[u8]) -
+         ("tak", "tak")
+     } else if probe.starts_with(b"DSD ") || probe.starts_with(b"FRM8") {
+         ("dsf", "dsd_lsbf")
+-    } else if probe.starts_with(b"#!AMR") {
+-        ("amr", "amr_nb")
+     } else {
+         ("w64", "pcm_s16le")
+     };
+@@ -3381,25 +5579,80 @@ fn parse_hi_res_audio_streaming(reader: MediaReader, _src: &str, probe: &[u8]) -
+     })
+ }
+ 
++/// Raw AC-3 (`0x0B77`) / DTS (`0x7FFE8001`) bitstream demuxer: walks the file frame by frame with
++/// the exact frame-size tables, so files of any size play completely with real durations.
+ fn parse_cinema_audio_streaming(reader: MediaReader, _src: &str, probe: &[u8]) -> Result<ContainerInput> {
++    const MAX_ENTRIES: usize = 8_000_000;
+     let file_len = reader.len();
+     let codec = if probe.starts_with(&[0x0B, 0x77]) { "ac3" } else { "dts" };
++    let is_eac3 = codec == "ac3" && probe.get(2).is_some_and(|b| b & 0xC0 == 0xC0);
++    let codec = if is_eac3 { "eac3" } else { codec };
++
++    let mut entries = Vec::new();
++    let mut pos = 0u64;
++    let mut pts = 0i64;
++    let mut sample_rate = 48_000u32;
++    let mut channels = 2u16;
++    let mut samples_total = 0i64;
++
++    let is_ac3_family = codec == "eac3" || codec == "ac3";
++    while pos + 8 <= file_len && entries.len() < MAX_ENTRIES {
++        let hdr = reader.read_vec_at(pos, 16);
++        if hdr.len() < 8 {
++            break;
++        }
++        let frame_size = if is_ac3_family {
++            ac3_frame_header(&hdr).filter(|(sz, _, _, _)| *sz >= 96 && pos + *sz as u64 <= file_len).map(|(sz, _, _, _)| sz)
++        } else {
++            dts_frame_header(&hdr).filter(|(sz, _, _, _)| pos + *sz as u64 <= file_len).map(|(sz, _, _, _)| sz)
++        };
++        let Some(sz) = frame_size else {
++            pos += 1; // resync
++            continue;
++        };
++        if is_ac3_family {
++            let block_samples = ac3_frame_header(&hdr).map_or(1536i64, |(_, _, _, samples)| samples as i64);
++            entries.push(PacketEntry::slice(0, Some(pts), Some(pts), block_samples, true, pos, sz as u32));
++            pts += block_samples;
++            samples_total += block_samples;
++            if sample_rate == 48_000
++                && let Some((_, rate, ch, _)) = ac3_frame_header(&hdr)
++            {
++                sample_rate = rate.max(1);
++                channels = ch.max(1);
++            }
++        } else {
++            let (_, rate, ch, samples) = dts_frame_header(&hdr).unwrap();
++            entries.push(PacketEntry::slice(0, Some(pts), Some(pts), samples as i64, true, pos, sz as u32));
++            pts += samples as i64;
++            samples_total += samples as i64;
++            if sample_rate == 48_000 {
++                sample_rate = rate;
++                channels = ch.max(1);
++            }
++        }
++        pos += sz as u64;
++    }
++
++    if entries.is_empty() {
++        return Err(EngineError::Open { input: _src.to_owned(), reason: "raw bitstream has no valid frames".into() });
++    }
++    let duration = if sample_rate > 0 { Some(samples_total as f64 / f64::from(sample_rate)) } else { None };
+     let stream = StreamDesc {
+         index: 0,
+         kind: MediaKind::Audio,
+         codec: codec.into(),
+-        time_base: (1, 48_000),
+-        channels: 6,
+-        channel_layout: "5.1".into(),
+-        sample_rate: 48_000,
++        time_base: (1, sample_rate as i32),
++        channels,
++        channel_layout: channel_layout_name(channels),
++        sample_rate,
+         ..Default::default()
+     };
+-    let entries = vec![PacketEntry::slice(0, Some(0), Some(0), 1536, true, 0, file_len.min(65536) as u32)];
+     Ok(ContainerInput {
+         format_name: codec.into(),
+-        duration: Some(10.0),
++        duration,
+         start_time: 0.0,
+-        bit_rate: None,
++        bit_rate: duration.filter(|d| *d > 0.0).map(|d| (file_len as f64 * 8.0 / d) as u64),
+         size_bytes: Some(file_len),
+         seekable: true,
+         metadata: Vec::new(),
+@@ -3529,8 +5782,70 @@ fn parse_y4m_streaming(reader: MediaReader, src: &str) -> Result<ContainerInput>
+ }
+ 
+ fn parse_image_media(reader: MediaReader, src: &str) -> Result<ContainerInput> {
++    const MAX_DECODED_BYTES: usize = 256 << 20;
+     let file_len = reader.len();
+     let bytes = reader.read_vec_at(0, file_len.min(64 << 20) as usize);
++
++    // Animated GIF: decode every frame (inline RGBA packets); duration comes from the frame delays.
++    if bytes.starts_with(b"GIF8")
++        && let Ok(decoder) = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes.as_slice()))
++    {
++        use image::AnimationDecoder as _;
++        let (fw, fh) = image::ImageDecoder::dimensions(&decoder);
++        let (fw, fh) = (fw.max(1), fh.max(1));
++        let mut entries = Vec::new();
++        let mut pts_us = 0i64;
++        let mut decoded = 0usize;
++        let mut fps_sum = 0.0f64;
++        for frame in decoder.into_frames() {
++            let Ok(frame) = frame else { break };
++            let (d_num, d_den) = frame.delay().numer_denom_ms();
++            let delay_ms = d_num as f64 / u32::from(d_den.max(1)) as f64;
++            let dur_us = (delay_ms * 1000.0).round().max(20_000.0) as i64;
++            let rgba = frame.buffer().as_raw().clone();
++            decoded += rgba.len();
++            if decoded > MAX_DECODED_BYTES {
++                break;
++            }
++            entries.push(PacketEntry::inline(0, Some(pts_us), Some(pts_us), dur_us, true, rgba));
++            pts_us += dur_us;
++            fps_sum += 1000.0 / delay_ms.max(1.0);
++        }
++        if !entries.is_empty() {
++            let n = entries.len() as f64;
++            let fps = (fps_sum / n).clamp(1.0, 60.0).round().max(1.0) as u32;
++            let stream = StreamDesc {
++                index: 0,
++                kind: MediaKind::Video,
++                codec: "gif".into(),
++                time_base: (1, 1_000_000),
++                width: fw,
++                height: fh,
++                fps: Some((fps, 1)),
++                pix_fmt: Pixel::RGBA,
++                bit_depth: 8,
++                ..Default::default()
++            };
++            return Ok(ContainerInput {
++                format_name: "gif".into(),
++                duration: Some(pts_us as f64 / 1_000_000.0),
++                start_time: 0.0,
++                bit_rate: None,
++                size_bytes: Some(file_len),
++                seekable: true,
++                metadata: Vec::new(),
++                chapters: Vec::new(),
++                streams: vec![stream],
++                cover_art_bytes: None,
++                program_stream_seek: false,
++                reader,
++                entries,
++                cursor: 0,
++                mkv_state: None,
++            });
++        }
++    }
++
+     let img = image::load_from_memory(&bytes).map_err(|e| EngineError::Open { input: src.to_owned(), reason: e.to_string() })?;
+     let rgba = img.to_rgba8();
+     let (w, h) = (rgba.width(), rgba.height());

@@ -8,6 +8,12 @@ description = "400_media_player engine: 100% pure-Rust native demux/decode, bwdi
 
 [dependencies]
 media_player_400-core.workspace = true
+rmedia.workspace = true
+rmedia-util.workspace = true
+rmedia-codec.workspace = true
+rmedia-swscale.workspace = true
+rmedia-swresample.workspace = true
+rmedia-format.workspace = true
 realfft.workspace = true
 rustfft.workspace = true
 cpal.workspace = true
@@ -30,3 +36,9 @@ oxideav-mpeg12video.workspace = true
 oxideav-mpeg4video.workspace = true
 oxideav-prores.workspace = true
 bytemuck.workspace = true
+
+[features]
+nut_debug = []
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,43 @@
+[package]
+name = "rmedia-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Command-line tools (rmedia/ffmpeg, rmedia-probe/ffprobe, rmedia-play/ffplay) in 100% pure Rust"
+
+[lints]
+workspace = true
+
+[dependencies]
+rmedia-util = { workspace = true }
+rmedia-codec = { workspace = true }
+rmedia-format = { workspace = true }
+rmedia-swscale = { workspace = true }
+rmedia-swresample = { workspace = true }
+rmedia-filter = { workspace = true }
+rmedia-device = { workspace = true }
+
+[[bin]]
+name = "rmedia"
+path = "src/bin/rmedia.rs"
+
+[[bin]]
+name = "ffmpeg"
+path = "src/bin/ffmpeg.rs"
+
+[[bin]]
+name = "rmedia-probe"
+path = "src/bin/rmedia_probe.rs"
+
+[[bin]]
+name = "ffprobe"
+path = "src/bin/ffprobe.rs"
+
+[[bin]]
+name = "rmedia-play"
+path = "src/bin/rmedia_play.rs"
+
+[[bin]]
+name = "ffplay"
+path = "src/bin/ffplay.rs"

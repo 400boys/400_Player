@@ -1,0 +1,13 @@
+[package]
+name = "rmedia-swscale"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Image scaling, pixel format conversion, color matrix and dithering in 100% pure Rust (libswscale reproduction)"
+
+[lints]
+workspace = true
+
+[dependencies]
+rmedia-util = { workspace = true }

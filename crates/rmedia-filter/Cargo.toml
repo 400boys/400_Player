@@ -1,0 +1,16 @@
+[package]
+name = "rmedia-filter"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Audio and video filter graph engine in 100% pure Rust (libavfilter reproduction)"
+
+[lints]
+workspace = true
+
+[dependencies]
+rmedia-util = { workspace = true }
+rmedia-codec = { workspace = true }
+rmedia-swscale = { workspace = true }
+rmedia-swresample = { workspace = true }

@@ -1926,10 +1926,17 @@ dependencies = [
  "oxideav-vorbis",
  "parking_lot",
  "realfft",
+ "rmedia",
+ "rmedia-codec",
+ "rmedia-format",
+ "rmedia-swresample",
+ "rmedia-swscale",
+ "rmedia-util",
  "rtrb",
  "rust_h264",
  "rust_h265",
  "rustfft",
+ "serde_json",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -3097,6 +3104,84 @@ dependencies = [
  "web-sys",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "rmedia"
+version = "0.1.0"
+dependencies = [
+ "rmedia-codec",
+ "rmedia-device",
+ "rmedia-filter",
+ "rmedia-format",
+ "rmedia-swresample",
+ "rmedia-swscale",
+ "rmedia-util",
+]
+
+[[package]]
+name = "rmedia-codec"
+version = "0.1.0"
+dependencies = [
+ "rmedia-util",
+]
+
+[[package]]
+name = "rmedia-device"
+version = "0.1.0"
+dependencies = [
+ "rmedia-codec",
+ "rmedia-format",
+ "rmedia-util",
+]
+
+[[package]]
+name = "rmedia-filter"
+version = "0.1.0"
+dependencies = [
+ "rmedia-codec",
+ "rmedia-swresample",
+ "rmedia-swscale",
+ "rmedia-util",
+]
+
+[[package]]
+name = "rmedia-format"
+version = "0.1.0"
+dependencies = [
+ "rmedia-codec",
+ "rmedia-util",
+]
+
+[[package]]
+name = "rmedia-swresample"
+version = "0.1.0"
+dependencies = [
+ "rmedia-util",
+]
+
+[[package]]
+name = "rmedia-swscale"
+version = "0.1.0"
+dependencies = [
+ "rmedia-util",
+]
+
+[[package]]
+name = "rmedia-tools"
+version = "0.1.0"
+dependencies = [
+ "rmedia-codec",
+ "rmedia-device",
+ "rmedia-filter",
+ "rmedia-format",
+ "rmedia-swresample",
+ "rmedia-swscale",
+ "rmedia-util",
+]
+
+[[package]]
+name = "rmedia-util"
+version = "0.1.0"
 
 [[package]]
 name = "roxmltree"

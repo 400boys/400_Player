@@ -44,6 +44,9 @@ use rust_h265::nal::{
     parse_annex_b as hevc_parse_annex_b, parse_hvcc as hevc_parse_hvcc, parse_nal as hevc_parse_nal,
 };
 
+use rmedia_codec::context::Decoder as RmediaDecoder;
+use rmedia_codec::{find_decoder as rmedia_find_decoder, CodecContext as RmediaCodecContext, CodecId as RmediaCodecId};
+
 use crate::container::{MediaPacket, StreamDesc};
 use crate::error::{EngineError, Result};
 use crate::frame::{Pixel, RawVideoFrame};
@@ -75,11 +78,19 @@ fn is_supported_video_codec(codec: &str) -> bool {
             | "h265"
             | "hvc1"
             | "hev1"
+            | "av1"
+            | "av01"
+            | "vp8"
+            | "vp9"
             | "mpeg1video"
             | "mpeg2video"
             | "mpeg4"
             | "mpeg4video"
             | "prores"
+            | "ffv1"
+            | "qoi"
+            | "tga"
+            | "pnm"
             | "mjpeg"
             | "jpeg"
             | "png"
@@ -121,6 +132,8 @@ fn is_supported_audio_codec(codec: &str) -> bool {
             | "pcm_alaw"
             | "pcm_mulaw"
             | "adpcm_ima_wav"
+            | "adpcm_ima_caf"
+            | "adpcm_ms"
             | "dsd_lsbf"
             | "dsd_msbf"
             | "l4a1"
@@ -137,6 +150,7 @@ pub enum DiscardMode {
 }
 
 enum PureVideoBackend {
+    Rmedia(Box<dyn RmediaDecoder>),
     H264 {
         decoder: Box<H264ThreadedDecoder<Option<i64>>>,
         avcc_len_size: Option<usize>,
@@ -205,6 +219,9 @@ impl VideoDecoder {
                     let _ = dec.reset();
                 }));
             }
+            PureVideoBackend::Rmedia(dec) => {
+                dec.flush();
+            }
             PureVideoBackend::RawOrImage => {}
         }
     }
@@ -235,6 +252,22 @@ impl VideoDecoder {
 
         let pts = pkt.pts().or(pkt.dts());
         match &mut self.backend {
+            PureVideoBackend::Rmedia(decoder) => {
+                let mut rpkt = rmedia_util::packet::Packet::from_slice(data);
+                if let Some(p) = pts {
+                    rpkt.pts = p;
+                    rpkt.dts = p;
+                }
+                rpkt.set_keyframe(pkt.is_key());
+                if decoder.send_packet(Some(&rpkt)).is_ok() {
+                    let mut frame = rmedia_util::frame::Frame::default();
+                    while decoder.receive_frame(&mut frame).is_ok() {
+                        self.has_reference = true;
+                        self.out_queue.push_back(rmedia_video_to_raw(&self.stream, &frame, pts));
+                    }
+                }
+                return Ok(());
+            }
             PureVideoBackend::H264 { decoder, avcc_len_size } => {
                 if data.is_empty() {
                     return Ok(());
@@ -337,10 +370,13 @@ impl VideoDecoder {
                         while let Ok(OxideFrame::Video(vf)) = dec.receive_frame() {
                             out.push(vf);
                         }
+                    } else {
+                        out.clear();
+                        return Err(());
                     }
-                    out
+                    Ok(out)
                 }));
-                if let Ok(frames) = res {
+                if let Ok(Ok(frames)) = res {
                     for vf in frames {
                         self.has_reference = true;
                         self.out_queue.push_back(oxide_video_to_raw(&self.stream, vf, pts));
@@ -404,6 +440,13 @@ impl VideoDecoder {
                     }
                 }
             }
+            PureVideoBackend::Rmedia(decoder) => {
+                let _ = decoder.send_packet(None);
+                let mut frame = rmedia_util::frame::Frame::default();
+                while decoder.receive_frame(&mut frame).is_ok() {
+                    self.out_queue.push_back(rmedia_video_to_raw(&self.stream, &frame, None));
+                }
+            }
             PureVideoBackend::RawOrImage => {}
         }
         Ok(())
@@ -415,6 +458,35 @@ impl VideoDecoder {
 }
 
 fn create_video_backend(stream: &StreamDesc) -> PureVideoBackend {
+    let rmedia_cid = match stream.codec.as_str() {
+        "av1" | "av01" => Some(RmediaCodecId::Av1),
+        "vp8" => Some(RmediaCodecId::Vp8),
+        "vp9" => Some(RmediaCodecId::Vp9),
+        "ffv1" => Some(RmediaCodecId::Ffv1),
+        "qoi" => Some(RmediaCodecId::Qoi),
+        "tga" => Some(RmediaCodecId::Tga),
+        "pnm" => Some(RmediaCodecId::Pnm),
+        "mjpeg" | "jpeg" => Some(RmediaCodecId::Mjpeg),
+        "png" => Some(RmediaCodecId::Png),
+        "bmp" => Some(RmediaCodecId::Bmp),
+        "gif" => Some(RmediaCodecId::Gif),
+        "webp" => Some(RmediaCodecId::WebP),
+        "prores" => Some(RmediaCodecId::ProRes),
+        "mpeg1video" => Some(RmediaCodecId::Mpeg1Video),
+        "mpeg2video" => Some(RmediaCodecId::Mpeg2Video),
+        "rawvideo" => Some(RmediaCodecId::RawVideo),
+        _ => None,
+    };
+    if let Some(cid) = rmedia_cid {
+        let mut ctx = RmediaCodecContext::new(cid);
+        ctx.width = stream.width as usize;
+        ctx.height = stream.height as usize;
+        ctx.extradata = stream.extra_data.clone();
+        if let Some(dec) = rmedia_find_decoder(ctx) {
+            return PureVideoBackend::Rmedia(dec);
+        }
+    }
+
     match stream.codec.as_str() {
         "h264" | "avc" | "avc1" => {
             let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
@@ -626,6 +698,51 @@ fn hevc_frame_to_raw(stream: &StreamDesc, hf: HevcFrame, pts: Option<i64>) -> Ra
     frame
 }
 
+fn rmedia_video_to_raw(stream: &StreamDesc, f: &rmedia_util::frame::Frame, fallback_pts: Option<i64>) -> RawVideoFrame {
+    let (format, num_planes) = match f.format {
+        rmedia_util::frame::FrameFormat::Video(rmedia_util::pixfmt::PixelFormat::Yuv420p) => (Pixel::YUV420P, 3),
+        rmedia_util::frame::FrameFormat::Video(rmedia_util::pixfmt::PixelFormat::Yuv422p) => (Pixel::YUV422P, 3),
+        rmedia_util::frame::FrameFormat::Video(rmedia_util::pixfmt::PixelFormat::Yuv444p) => (Pixel::YUV444P, 3),
+        rmedia_util::frame::FrameFormat::Video(rmedia_util::pixfmt::PixelFormat::Rgb24) => (Pixel::RGB24, 1),
+        rmedia_util::frame::FrameFormat::Video(rmedia_util::pixfmt::PixelFormat::Rgba) => (Pixel::RGBA, 1),
+        rmedia_util::frame::FrameFormat::Video(rmedia_util::pixfmt::PixelFormat::Bgr24) => (Pixel::RGB24, 1),
+        rmedia_util::frame::FrameFormat::Video(rmedia_util::pixfmt::PixelFormat::Bgra) => (Pixel::RGBA, 1),
+        rmedia_util::frame::FrameFormat::Video(rmedia_util::pixfmt::PixelFormat::Gray8) => (Pixel::GRAY8, 1),
+        _ => (Pixel::YUV420P, 3),
+    };
+
+    let w = (f.width as u32).max(stream.width).max(1);
+    let h = (f.height as u32).max(stream.height).max(1);
+    let mut frame = RawVideoFrame::new(format, w, h);
+    let pts = if f.pts != rmedia_util::rational::NOPTS_VALUE { Some(f.pts) } else { fallback_pts };
+    frame.set_pts(pts);
+    frame.set_aspect_ratio(stream.sar);
+    frame.set_interlaced(stream.interlaced, true);
+    frame.set_color_space(stream.color_space);
+    frame.set_color_range(stream.color_range);
+    frame.set_color_transfer_characteristic(stream.color_trc);
+    frame.set_color_primaries(stream.color_primaries);
+
+    for p_idx in 0..num_planes {
+        if let Some(ref plane) = f.planes[p_idx] {
+            let dst_w = frame.plane_width(p_idx) as usize;
+            let dst_h = frame.plane_height(p_idx) as usize;
+            let dst_stride = frame.stride(p_idx);
+            let src_stride = f.linesize[p_idx].max(dst_w);
+            let dst = frame.data_mut(p_idx);
+            let src_data = plane.as_slice();
+            for row in 0..dst_h {
+                let s_off = row * src_stride;
+                let d_off = row * dst_stride;
+                if s_off + dst_w <= src_data.len() && d_off + dst_w <= dst.len() {
+                    dst[d_off..d_off + dst_w].copy_from_slice(&src_data[s_off..s_off + dst_w]);
+                }
+            }
+        }
+    }
+    frame
+}
+
 fn oxide_video_to_raw(stream: &StreamDesc, vf: OxideVideoFrame, fallback_pts: Option<i64>) -> RawVideoFrame {
     let w = vf
         .planes
@@ -833,7 +950,11 @@ impl RawAudioFrame {
 pub struct AudioDecoder {
     stream: StreamDesc,
     out_queue: VecDeque<RawAudioFrame>,
+    rmedia_dec: Option<Box<dyn RmediaDecoder>>,
     oxide_dec: Option<Box<dyn OxideDecoder>>,
+    /// MPEG-1 audio Layer I/II packets are routed here (`oxideav-mp1`), because the Layer III
+    /// decoder rejects them. Created lazily on the first such packet.
+    layer12_dec: Option<Box<dyn OxideDecoder>>,
 }
 
 impl AudioDecoder {
@@ -850,17 +971,27 @@ impl AudioDecoder {
                 reason: format!("unsupported audio codec '{}'", stream.codec),
             });
         }
-        let oxide_dec = create_oxide_audio_decoder(stream);
+        let rmedia_dec = create_rmedia_audio_decoder(stream);
+        let oxide_dec = if rmedia_dec.is_none() {
+            create_oxide_audio_decoder(stream)
+        } else {
+            None
+        };
         Ok(Self {
             stream: stream.clone(),
             out_queue: VecDeque::new(),
+            rmedia_dec,
             oxide_dec,
+            layer12_dec: None,
         })
     }
 
     pub fn flush(&mut self) {
         self.out_queue.clear();
-        if let Some(dec) = self.oxide_dec.as_mut() {
+        if let Some(ref mut dec) = self.rmedia_dec {
+            dec.flush();
+        }
+        for dec in self.oxide_dec.iter_mut().chain(self.layer12_dec.iter_mut()) {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = dec.reset();
             }));
@@ -873,6 +1004,23 @@ impl AudioDecoder {
 
     pub fn send_packet(&mut self, pkt: &MediaPacket) -> Result<()> {
         let data = pkt.data();
+        if let Some(ref mut dec) = self.rmedia_dec {
+            let mut rpkt = rmedia_util::packet::Packet::from_slice(data);
+            if let Some(p) = pkt.pts().or(pkt.dts()) {
+                rpkt.pts = p;
+                rpkt.dts = p;
+            }
+            rpkt.set_keyframe(pkt.is_key());
+            if dec.send_packet(Some(&rpkt)).is_ok() {
+                let mut frame = rmedia_util::frame::Frame::default();
+                while dec.receive_frame(&mut frame).is_ok() {
+                    let raw = rmedia_audio_to_raw(&self.stream, &frame, pkt.pts().or(pkt.dts()));
+                    self.out_queue.push_back(raw);
+                }
+                return Ok(());
+            }
+        }
+
         if data.windows(4).any(|w| w == b"L4A1")
             || (data.len() >= 6 && data[0] == 0xFF && (data[1] & 0xFE) == 0xF8)
         {
@@ -881,7 +1029,22 @@ impl AudioDecoder {
             return Ok(());
         }
 
-        if let Some(dec) = self.oxide_dec.as_mut()
+        let dec: Option<&mut Box<dyn OxideDecoder>> = if self.oxide_dec.is_some() && !data.is_empty() {
+            match mpeg_audio_layer(data) {
+                // Layer I / II: the Layer III decoder rejects them; route to the mp1 decoder.
+                Some((false, _)) => {
+                    if self.layer12_dec.is_none() {
+                        self.layer12_dec = create_oxide_audio_decoder_for("mp1", &self.stream);
+                    }
+                    self.layer12_dec.as_mut().or(self.oxide_dec.as_mut())
+                }
+                _ => self.oxide_dec.as_mut(),
+            }
+        } else {
+            None
+        };
+
+        if let Some(dec) = dec
             && !data.is_empty()
         {
             let pts = pkt.pts().or(pkt.dts());
@@ -890,6 +1053,8 @@ impl AudioDecoder {
                 i64::from(self.stream.time_base.1.max(1)),
             );
             let payload = if self.stream.codec == "aac" {
+                // The oxideav-aac decoder only accepts ADTS/LOAS carriers: raw MP4/MKV AAC
+                // packets get an ADTS header built from the AudioSpecificConfig.
                 ensure_aac_adts_frame(data, &self.stream.extra_data, self.stream.sample_rate, self.stream.channels)
             } else {
                 data.to_vec()
@@ -912,11 +1077,16 @@ impl AudioDecoder {
                 }
                 out
             }));
-            if let Ok(frames) = res {
-                for af in frames {
-                    if let Some(raw_af) = oxide_audio_to_raw(&self.stream, af, pts) {
-                        self.out_queue.push_back(raw_af);
+            match res {
+                Ok(frames) => {
+                    for af in frames {
+                        if let Some(raw_af) = oxide_audio_to_raw(&self.stream, af, pts) {
+                            self.out_queue.push_back(raw_af);
+                        }
                     }
+                }
+                Err(_) => {
+                    return Err(EngineError::Decoder { codec: self.stream.codec.clone(), reason: "audio decoder panicked".into() });
                 }
             }
             return Ok(());
@@ -928,7 +1098,15 @@ impl AudioDecoder {
     }
 
     pub fn send_eof(&mut self) -> Result<()> {
-        if let Some(dec) = self.oxide_dec.as_mut() {
+        if let Some(ref mut dec) = self.rmedia_dec {
+            let _ = dec.send_packet(None);
+            let mut frame = rmedia_util::frame::Frame::default();
+            while dec.receive_frame(&mut frame).is_ok() {
+                let raw = rmedia_audio_to_raw(&self.stream, &frame, None);
+                self.out_queue.push_back(raw);
+            }
+        }
+        for dec in self.oxide_dec.iter_mut().chain(self.layer12_dec.iter_mut()) {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut out = Vec::new();
                 let _ = dec.flush();
@@ -953,6 +1131,101 @@ impl AudioDecoder {
     }
 }
 
+/// MPEG-1 audio frame header probe: returns `Some((is_layer3, is_mpeg_audio))` for packets that
+/// start with a valid MPEG audio frame header.
+fn mpeg_audio_layer(data: &[u8]) -> Option<(bool, bool)> {
+    if data.len() < 4 || data[0] != 0xFF || (data[1] & 0xE0) != 0xE0 {
+        return None;
+    }
+    let version_bits = (data[1] >> 3) & 0x03;
+    if version_bits == 1 {
+        return None; // reserved version
+    }
+    let layer_bits = (data[1] >> 1) & 0x03;
+    if layer_bits == 0 {
+        return None; // reserved layer
+    }
+    let bitrate_idx = (data[2] >> 4) & 0x0F;
+    if bitrate_idx == 0x0F || bitrate_idx == 0 {
+        return None;
+    }
+    let sample_rate_idx = (data[2] >> 2) & 0x03;
+    if sample_rate_idx == 0x03 {
+        return None;
+    }
+    let emphasis = data[3] & 0x03;
+    if emphasis == 0x02 {
+        return None;
+    }
+    // layer bits: 11 = Layer I, 10 = Layer II, 01 = Layer III
+    Some((layer_bits == 0x01, true))
+}
+
+fn create_rmedia_audio_decoder(stream: &StreamDesc) -> Option<Box<dyn RmediaDecoder>> {
+    let cid = match stream.codec.as_str() {
+        "aac" | "mp4a" => Some(RmediaCodecId::Aac),
+        "mp3" => Some(RmediaCodecId::Mp3),
+        "flac" => Some(RmediaCodecId::Flac),
+        "vorbis" => Some(RmediaCodecId::Vorbis),
+        "opus" => Some(RmediaCodecId::Opus),
+        "ac3" | "ac-3" => Some(RmediaCodecId::Ac3),
+        "eac3" | "ec-3" => Some(RmediaCodecId::Eac3),
+        "alac" => Some(RmediaCodecId::Alac),
+        "pcm_s16le" => Some(RmediaCodecId::PcmS16le),
+        "pcm_s16be" => Some(RmediaCodecId::PcmS16be),
+        "pcm_u8" => Some(RmediaCodecId::PcmU8),
+        "pcm_s24le" => Some(RmediaCodecId::PcmS24le),
+        "pcm_s32le" => Some(RmediaCodecId::PcmS32le),
+        "pcm_f32le" => Some(RmediaCodecId::PcmF32le),
+        "alaw" => Some(RmediaCodecId::G711Alaw),
+        "mulaw" => Some(RmediaCodecId::G711Mulaw),
+        "adpcm_ima_wav" => Some(RmediaCodecId::AdpcmImaWav),
+        "adpcm_ms" => Some(RmediaCodecId::AdpcmMs),
+        _ => None,
+    };
+    cid.and_then(|id| {
+        let mut ctx = RmediaCodecContext::new(id);
+        ctx.sample_rate = stream.sample_rate;
+        ctx.ch_layout = rmedia_util::channel_layout::ChannelLayout::from_channels(stream.channels as u32);
+        ctx.extradata = stream.extra_data.clone();
+        rmedia_find_decoder(ctx)
+    })
+}
+
+fn rmedia_audio_to_raw(_stream: &StreamDesc, f: &rmedia_util::frame::Frame, pts: Option<i64>) -> RawAudioFrame {
+    let channels = f.channel_layout.nb_channels.max(1) as u16;
+    let sample_rate = f.sample_rate.max(1);
+    let nb_samples = f.nb_samples;
+    let mut out_samples = vec![0.0f32; nb_samples * channels as usize];
+
+    match f.format {
+        rmedia_util::frame::FrameFormat::Audio(rmedia_util::samplefmt::SampleFormat::FltP) => {
+            for ch in 0..channels as usize {
+                if let Some(ref plane) = f.planes[ch] {
+                    let mut ch_samples = vec![0.0f32; nb_samples];
+                    rmedia_swresample::converter::bytes_to_f32(plane.as_slice(), rmedia_util::samplefmt::SampleFormat::FltP, &mut ch_samples);
+                    for s in 0..nb_samples {
+                        out_samples[s * channels as usize + ch] = ch_samples[s];
+                    }
+                }
+            }
+        }
+        rmedia_util::frame::FrameFormat::Audio(fmt) => {
+            if let Some(ref plane) = f.planes[0] {
+                rmedia_swresample::converter::bytes_to_f32(plane.as_slice(), fmt, &mut out_samples);
+            }
+        }
+        _ => {}
+    }
+
+    RawAudioFrame {
+        samples: out_samples,
+        channels,
+        sample_rate,
+        pts: pts.or(if f.pts != rmedia_util::rational::NOPTS_VALUE { Some(f.pts) } else { None }),
+    }
+}
+
 fn create_oxide_audio_decoder(stream: &StreamDesc) -> Option<Box<dyn OxideDecoder>> {
     let codec_id = match stream.codec.as_str() {
         "eac3" | "ec-3" => "eac3",
@@ -960,11 +1233,15 @@ fn create_oxide_audio_decoder(stream: &StreamDesc) -> Option<Box<dyn OxideDecode
         "aac" | "mp4a" => "aac",
         "opus" => "opus",
         "vorbis" => "vorbis",
-        "mp1" => "mp1",
-        "mp2" => "mp2",
+        // oxideav-mp1 registers MPEG-1 audio and decodes Layer I *and* Layer II frames.
+        "mp1" | "mp2" => "mp1",
         "mp3" => "mp3",
         _ => return None,
     };
+    create_oxide_audio_decoder_for(codec_id, stream)
+}
+
+fn create_oxide_audio_decoder_for(codec_id: &str, stream: &StreamDesc) -> Option<Box<dyn OxideDecoder>> {
     let ctx = oxide_runtime();
     let mut params = CodecParameters::audio(CodecId::new(codec_id));
     params.sample_rate = Some(stream.sample_rate.max(8000));
@@ -1168,7 +1445,9 @@ fn decode_audio_packet(stream: &StreamDesc, pkt: &MediaPacket) -> Result<RawAudi
             let samples: Vec<f32> = data.iter().map(|&b| f32::from(mulaw_to_s16(b)) / 32768.0).collect();
             Ok(RawAudioFrame { samples, channels: ch, sample_rate: sr, pts })
         }
-        "adpcm_ima_wav" => Ok(decode_ima_adpcm(data, ch, sr, pts)),
+        "adpcm_ima_wav" => Ok(decode_ima_adpcm_wav(data, stream.block_align, ch, sr, pts)),
+        "adpcm_ima_caf" => Ok(decode_ima_adpcm_caf(data, stream.block_align, ch, sr, pts)),
+        "adpcm_ms" => Ok(decode_ms_adpcm(data, stream.block_align, ch, sr, pts)),
         "dsd_lsbf" | "dsd_msbf" => {
             let samples: Vec<f32> = data.iter().map(|&b| (f32::from(b.count_ones() as u8) - 4.0) / 4.0).collect();
             Ok(RawAudioFrame { samples, channels: ch, sample_rate: sr, pts })
@@ -1210,43 +1489,213 @@ const IMA_STEP_TABLE: [i32; 89] = [
 ];
 const IMA_INDEX_TABLE: [i32; 16] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
 
-fn decode_ima_adpcm(data: &[u8], ch: u16, sr: u32, pts: Option<i64>) -> RawAudioFrame {
+/// IMA ADPCM in WAV/AVI layout: packets are whole blocks (4-byte header per channel, then nibble
+/// bytes interleaved by channel). `block_align == 0` treats the packet as a single block.
+fn decode_ima_adpcm_wav(data: &[u8], block_align: u16, ch: u16, sr: u32, pts: Option<i64>) -> RawAudioFrame {
     let ch_u = usize::from(ch.max(1));
-    if data.len() < 4 * ch_u {
-        return RawAudioFrame { samples: Vec::new(), channels: ch, sample_rate: sr, pts };
-    }
-    let mut pred = vec![0i32; ch_u];
-    let mut idx = vec![0i32; ch_u];
-    for c in 0..ch_u {
-        pred[c] = i32::from(i16::from_le_bytes([data[c * 4], data[c * 4 + 1]]));
-        idx[c] = i32::from(data[c * 4 + 2]).clamp(0, 88);
-    }
+    let ba = usize::from(block_align.max((4 * ch_u + 1) as u16));
     let mut samples = Vec::with_capacity(data.len() * 2);
-    for (i, &byte) in data[4 * ch_u..].iter().enumerate() {
-        let c = i % ch_u;
-        for shift in [0, 4] {
-            let nib = ((byte >> shift) & 0x0F) as usize;
-            let step = IMA_STEP_TABLE[idx[c] as usize];
-            let mut diff = step >> 3;
-            if (nib & 1) != 0 {
-                diff += step >> 2;
+    let mut off = 0usize;
+    while off + 4 * ch_u <= data.len() {
+        let block_len = if block_align == 0 { data.len() } else { ba.min(data.len() - off) };
+        if block_len < 4 * ch_u {
+            break;
+        }
+        let block = &data[off..off + block_len];
+        off += block_len;
+        let mut pred = vec![0i32; ch_u];
+        let mut idx = vec![0i32; ch_u];
+        for c in 0..ch_u {
+            pred[c] = i32::from(i16::from_le_bytes([block[c * 4], block[c * 4 + 1]]));
+            idx[c] = i32::from(block[c * 4 + 2]).clamp(0, 88);
+        }
+        // WAV IMA: nibble bytes round-robin across channels, low nibble first.
+        for (i, &byte) in block[4 * ch_u..].iter().enumerate() {
+            let c = i % ch_u;
+            for nib_u in [(byte & 0x0F) as usize, (byte >> 4) as usize] {
+                let step = IMA_STEP_TABLE[idx[c] as usize];
+                let mut diff = step >> 3;
+                if (nib_u & 1) != 0 {
+                    diff += step >> 2;
+                }
+                if (nib_u & 2) != 0 {
+                    diff += step >> 1;
+                }
+                if (nib_u & 4) != 0 {
+                    diff += step;
+                }
+                if (nib_u & 8) != 0 {
+                    pred[c] = (pred[c] - diff).clamp(-32768, 32767);
+                } else {
+                    pred[c] = (pred[c] + diff).clamp(-32768, 32767);
+                }
+                idx[c] = (idx[c] + IMA_INDEX_TABLE[nib_u]).clamp(0, 88);
+                samples.push(pred[c] as f32 / 32768.0);
             }
-            if (nib & 2) != 0 {
-                diff += step >> 1;
-            }
-            if (nib & 4) != 0 {
-                diff += step;
-            }
-            if (nib & 8) != 0 {
-                pred[c] = (pred[c] - diff).clamp(-32768, 32767);
-            } else {
-                pred[c] = (pred[c] + diff).clamp(-32768, 32767);
-            }
-            idx[c] = (idx[c] + IMA_INDEX_TABLE[nib]).clamp(0, 88);
-            samples.push(pred[c] as f32 / 32768.0);
+        }
+        if block_align == 0 {
+            break;
         }
     }
     RawAudioFrame { samples, channels: ch, sample_rate: sr, pts }
+}
+
+
+/// Apple IMA4 inside CAF: packets of 34 bytes per channel (2-byte LE header = signed 9-bit
+/// predictor + 7-bit step index, then 32 nibble bytes, low nibble first, 64 samples).
+fn decode_ima_adpcm_caf(data: &[u8], block_align: u16, ch: u16, sr: u32, pts: Option<i64>) -> RawAudioFrame {
+    let ch_u = usize::from(ch.max(1));
+    let packet = usize::from(block_align).max(34 * ch_u);
+    let mut samples = Vec::with_capacity(data.len() * 2);
+    let mut off = 0usize;
+    while off + packet <= data.len() {
+        let pkt = &data[off..off + packet];
+        off += packet;
+        let mut frames_out = 0usize;
+        for c in 0..ch_u {
+            let hdr = &pkt[c * 34..c * 34 + 2];
+            let packed = u16::from_le_bytes([hdr[0], hdr[1]]) as u16 as i32;
+            let mut pred = ((packed << 23) >> 23); // sign-extend low 9 bits
+            let mut idx = (packed & 0x7F) as usize;
+            idx = idx.min(88);
+            for &byte in &pkt[c * 34 + 2..c * 34 + 34] {
+                for nib_u in [usize::from(byte & 0x0F), usize::from(byte >> 4)] {
+                    let step = IMA_STEP_TABLE[idx];
+                    let mut diff = step >> 3;
+                    if (nib_u & 1) != 0 {
+                        diff += step >> 2;
+                    }
+                    if (nib_u & 2) != 0 {
+                        diff += step >> 1;
+                    }
+                    if (nib_u & 4) != 0 {
+                        diff += step;
+                    }
+                    if (nib_u & 8) != 0 {
+                        pred = (pred - diff).clamp(-32768, 32767);
+                    } else {
+                        pred = (pred + diff).clamp(-32768, 32767);
+                    }
+                    idx = ((idx as i32) + IMA_INDEX_TABLE[nib_u]).clamp(0, 88) as usize;
+                    samples.push(pred as f32 / 32768.0);
+                    frames_out += 1;
+                }
+            }
+        }
+        // Interleave was per-channel; CAF packets decode channel-major, so re-interleave.
+        if ch_u > 1 && frames_out > 0 {
+            let per_ch = frames_out / ch_u;
+            let mut interleaved: Vec<f32> = Vec::with_capacity(samples.len());
+            let tail = samples.split_off(samples.len() - frames_out);
+            let start = samples.len();
+            let mut chans = Vec::with_capacity(ch_u);
+            for c in 0..ch_u {
+                chans.push(tail[c * per_ch..(c + 1) * per_ch].to_vec());
+            }
+            samples.truncate(start);
+            for f in 0..per_ch {
+                for c in 0..ch_u {
+                    samples.push(chans[c][f]);
+                }
+            }
+        }
+        if block_align == 0 {
+            break;
+        }
+    }
+    RawAudioFrame { samples, channels: ch, sample_rate: sr, pts }
+}
+
+/// Microsoft ADPCM (WAV/AVI): exact FFmpeg-compatible block decoder.
+const MS_ADAPT_COEFF1: [i32; 7] = [64, 128, 0, 48, 60, 115, 98];
+const MS_ADAPT_COEFF2: [i32; 7] = [0, -64, 0, 16, 0, -52, -58];
+const MS_ADAPTATION_TABLE: [i32; 16] = [
+    230, 230, 230, 230, 307, 409, 512, 614, 768, 614, 512, 409, 307, 230, 230, 230,
+];
+
+fn decode_ms_adpcm(data: &[u8], block_align: u16, ch: u16, sr: u32, pts: Option<i64>) -> RawAudioFrame {
+    let ch_u = usize::from(ch.max(1));
+    let ba = usize::from(block_align.max((7 * ch_u + 1) as u16));
+    let mut out = Vec::with_capacity(data.len() * 2);
+
+    #[derive(Clone, Copy)]
+    struct Ms {
+        coeff1: i32,
+        coeff2: i32,
+        delta: i32,
+        s1: i32,
+        s2: i32,
+    }
+    impl Ms {
+        #[inline]
+        fn nibble(&mut self, nib: u8) -> i32 {
+            let mut predictor = (self.s1 * self.coeff1 + self.s2 * self.coeff2) / 64;
+            predictor += i32::from(if nib & 0x08 != 0 { (nib as i32) - 0x10 } else { nib as i32 }) * self.delta;
+            self.s2 = self.s1;
+            self.s1 = predictor.clamp(-32768, 32767);
+            self.delta = ((MS_ADAPTATION_TABLE[usize::from(nib & 0x0F)] * self.delta) >> 8).clamp(16, i32::MAX / 768);
+            self.s1
+        }
+    }
+
+    let mut off = 0usize;
+    while off + 7 * ch_u <= data.len() {
+        let block_len = if block_align == 0 { data.len() } else { ba.min(data.len() - off) };
+        if block_len < 7 * ch_u {
+            break;
+        }
+        let block = &data[off..off + block_len];
+        off += block_len;
+
+        let mut state: Vec<Ms> = Vec::with_capacity(ch_u);
+        for c in 0..ch_u {
+            let p = usize::from(block[c * 7]).min(6);
+            state.push(Ms {
+                coeff1: MS_ADAPT_COEFF1[p],
+                coeff2: MS_ADAPT_COEFF2[p],
+                delta: i32::from(i16::from_le_bytes([block[c * 7 + 1], block[c * 7 + 2]])),
+                s1: i32::from(i16::from_le_bytes([block[c * 7 + 3], block[c * 7 + 4]])),
+                s2: i32::from(i16::from_le_bytes([block[c * 7 + 5], block[c * 7 + 6]])),
+            });
+        }
+        // The two initial samples are emitted before the nibble data.
+        for st in &state {
+            out.push(st.s2 as f32 / 32768.0);
+        }
+        for st in &state {
+            out.push(st.s1 as f32 / 32768.0);
+        }
+        let nibbles = &block[7 * ch_u..];
+        if ch_u <= 2 {
+            // Mono: two nibbles per byte; stereo: high nibble = ch0, low nibble = ch1 (FFmpeg layout).
+            for &byte in nibbles {
+                out.push((state[0].nibble(byte >> 4) as f32) / 32768.0);
+                if ch_u == 2 {
+                    out.push((state[1].nibble(byte & 0x0F) as f32) / 32768.0);
+                } else {
+                    out.push((state[0].nibble(byte & 0x0F) as f32) / 32768.0);
+                }
+            }
+        } else {
+            // Multi-channel: each channel has its own nibble section of `per_ch` bytes.
+            let per_ch = nibbles.len() / ch_u;
+            for n in 0..(per_ch * 2).max(1) {
+                for c in 0..ch_u {
+                    let idx0 = (n / 2) * ch_u + c;
+                    if idx0 >= nibbles.len() {
+                        continue;
+                    }
+                    let byte = nibbles[idx0];
+                    let nib = if n % 2 == 0 { byte >> 4 } else { byte & 0x0F };
+                    out.push((state[c].nibble(nib) as f32) / 32768.0);
+                }
+            }
+        }
+        if block_align == 0 {
+            break;
+        }
+    }
+    RawAudioFrame { samples: out, channels: ch, sample_rate: sr, pts }
 }
 
 // =================================================================================================
