@@ -458,35 +458,6 @@ impl VideoDecoder {
 }
 
 fn create_video_backend(stream: &StreamDesc) -> PureVideoBackend {
-    let rmedia_cid = match stream.codec.as_str() {
-        "av1" | "av01" => Some(RmediaCodecId::Av1),
-        "vp8" => Some(RmediaCodecId::Vp8),
-        "vp9" => Some(RmediaCodecId::Vp9),
-        "ffv1" => Some(RmediaCodecId::Ffv1),
-        "qoi" => Some(RmediaCodecId::Qoi),
-        "tga" => Some(RmediaCodecId::Tga),
-        "pnm" => Some(RmediaCodecId::Pnm),
-        "mjpeg" | "jpeg" => Some(RmediaCodecId::Mjpeg),
-        "png" => Some(RmediaCodecId::Png),
-        "bmp" => Some(RmediaCodecId::Bmp),
-        "gif" => Some(RmediaCodecId::Gif),
-        "webp" => Some(RmediaCodecId::WebP),
-        "prores" => Some(RmediaCodecId::ProRes),
-        "mpeg1video" => Some(RmediaCodecId::Mpeg1Video),
-        "mpeg2video" => Some(RmediaCodecId::Mpeg2Video),
-        "rawvideo" => Some(RmediaCodecId::RawVideo),
-        _ => None,
-    };
-    if let Some(cid) = rmedia_cid {
-        let mut ctx = RmediaCodecContext::new(cid);
-        ctx.width = stream.width as usize;
-        ctx.height = stream.height as usize;
-        ctx.extradata = stream.extra_data.clone();
-        if let Some(dec) = rmedia_find_decoder(ctx) {
-            return PureVideoBackend::Rmedia(dec);
-        }
-    }
-
     match stream.codec.as_str() {
         "h264" | "avc" | "avc1" => {
             let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
@@ -515,6 +486,23 @@ fn create_video_backend(stream: &StreamDesc) -> PureVideoBackend {
                 Ok(dec) => PureVideoBackend::Oxide(dec),
                 Err(_) => PureVideoBackend::RawOrImage,
             }
+        }
+        "qoi" | "tga" | "pnm" => {
+            let rmedia_cid = match stream.codec.as_str() {
+                "qoi" => Some(RmediaCodecId::Qoi),
+                "tga" => Some(RmediaCodecId::Tga),
+                "pnm" => Some(RmediaCodecId::Pnm),
+                _ => None,
+            };
+            if let Some(cid) = rmedia_cid {
+                let mut ctx = RmediaCodecContext::new(cid);
+                ctx.width = stream.width as usize;
+                ctx.height = stream.height as usize;
+                if let Some(dec) = rmedia_find_decoder(ctx) {
+                    return PureVideoBackend::Rmedia(dec);
+                }
+            }
+            PureVideoBackend::RawOrImage
         }
         _ => PureVideoBackend::RawOrImage,
     }
@@ -971,9 +959,9 @@ impl AudioDecoder {
                 reason: format!("unsupported audio codec '{}'", stream.codec),
             });
         }
-        let rmedia_dec = create_rmedia_audio_decoder(stream);
-        let oxide_dec = if rmedia_dec.is_none() {
-            create_oxide_audio_decoder(stream)
+        let oxide_dec = create_oxide_audio_decoder(stream);
+        let rmedia_dec = if oxide_dec.is_none() {
+            create_rmedia_audio_decoder(stream)
         } else {
             None
         };
@@ -1004,23 +992,6 @@ impl AudioDecoder {
 
     pub fn send_packet(&mut self, pkt: &MediaPacket) -> Result<()> {
         let data = pkt.data();
-        if let Some(ref mut dec) = self.rmedia_dec {
-            let mut rpkt = rmedia_util::packet::Packet::from_slice(data);
-            if let Some(p) = pkt.pts().or(pkt.dts()) {
-                rpkt.pts = p;
-                rpkt.dts = p;
-            }
-            rpkt.set_keyframe(pkt.is_key());
-            if dec.send_packet(Some(&rpkt)).is_ok() {
-                let mut frame = rmedia_util::frame::Frame::default();
-                while dec.receive_frame(&mut frame).is_ok() {
-                    let raw = rmedia_audio_to_raw(&self.stream, &frame, pkt.pts().or(pkt.dts()));
-                    self.out_queue.push_back(raw);
-                }
-                return Ok(());
-            }
-        }
-
         if data.windows(4).any(|w| w == b"L4A1")
             || (data.len() >= 6 && data[0] == 0xFF && (data[1] & 0xFE) == 0xF8)
         {
@@ -1090,6 +1061,23 @@ impl AudioDecoder {
                 }
             }
             return Ok(());
+        }
+
+        if let Some(ref mut dec) = self.rmedia_dec {
+            let mut rpkt = rmedia_util::packet::Packet::from_slice(data);
+            if let Some(p) = pkt.pts().or(pkt.dts()) {
+                rpkt.pts = p;
+                rpkt.dts = p;
+            }
+            rpkt.set_keyframe(pkt.is_key());
+            if dec.send_packet(Some(&rpkt)).is_ok() {
+                let mut frame = rmedia_util::frame::Frame::default();
+                while dec.receive_frame(&mut frame).is_ok() {
+                    let raw = rmedia_audio_to_raw(&self.stream, &frame, pkt.pts().or(pkt.dts()));
+                    self.out_queue.push_back(raw);
+                }
+                return Ok(());
+            }
         }
 
         let frame = decode_audio_packet(&self.stream, pkt)?;
